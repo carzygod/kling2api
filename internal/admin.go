@@ -248,7 +248,7 @@ func handleLoginSessionsAPI(w http.ResponseWriter, r *http.Request, parts []stri
 				writeError(w, http.StatusInternalServerError, "click_failed", err.Error())
 				return
 			}
-		} else if err := session.Click(682, 450); err != nil {
+		} else if err := session.OpenQRCodeLogin(); err != nil {
 			writeError(w, http.StatusInternalServerError, "click_login_failed", err.Error())
 			return
 		}

@@ -263,7 +263,10 @@ createApp({
         addModal.value=false;selectedId.value=(data.data||data.account).id;await loadAccounts();await testAccount(selectedId.value);return;
       }
       const data=await api("/api/accounts",{method:"POST",body:JSON.stringify({name})});
-      addModal.value=false;openQr(data.data||data.session);await refreshAll();
+      const session=data.data||data.session;
+      addModal.value=false;openQr(session);
+      await clickLoginEntry(session.id);
+      await refreshAll();
     }
     function openQr(session){qr.open=true;qr.session_id=session.id;qr.name=session.name;qr.status=session.status;qr.text=session.message||"";startQrPolling()}
     async function showSession(id){const data=await api("/api/login-sessions/"+encodeURIComponent(id));openQr(data.data||data.session)}

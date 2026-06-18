@@ -187,6 +187,22 @@ func (s *LoginSession) Click(x, y float64) error {
 	return s.RefreshScreenshot()
 }
 
+func (s *LoginSession) OpenQRCodeLogin() error {
+	err := s.runBrowser(30*time.Second,
+		chromedp.KeyEvent("\u001b"),
+		chromedp.Sleep(400*time.Millisecond),
+		chromedp.MouseClickXY(38, 736),
+		chromedp.Sleep(1800*time.Millisecond),
+		chromedp.MouseClickXY(906, 336),
+		chromedp.Sleep(2500*time.Millisecond),
+	)
+	if err != nil {
+		s.setError(err)
+		return err
+	}
+	return s.RefreshScreenshot()
+}
+
 func (s *LoginSession) Input(text string) error {
 	err := s.runBrowser(20*time.Second,
 		chromedp.KeyEvent(text),
