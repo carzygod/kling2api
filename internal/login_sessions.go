@@ -284,9 +284,19 @@ func (s *LoginSession) Capture(name string) (*AccountRecord, error) {
 		return nil, errors.New("no cookies captured from klingai.com")
 	}
 	cookieJSON, _ := json.Marshal(cookies)
+	probe := &AccountRecord{
+		Name:             name,
+		CookieJSON:       string(cookieJSON),
+		CookieString:     cookieString,
+		LocalStorageJSON: localStorageJSON,
+		UserAgent:        userAgent,
+	}
+	if ok, message := testKlingAccount(probe); !ok {
+		return nil, errors.New("captured Kling session is not authenticated: " + message)
+	}
 	account, err := AppStore.CreateAccount(AccountRecord{
 		Name:             name,
-		Status:           "captured",
+		Status:           "valid",
 		CookieJSON:       string(cookieJSON),
 		CookieString:     cookieString,
 		LocalStorageJSON: localStorageJSON,
@@ -296,6 +306,7 @@ func (s *LoginSession) Capture(name string) (*AccountRecord, error) {
 		s.setError(err)
 		return nil, err
 	}
+	_ = AppStore.SetAccountTestResult(account.ID, true, "klingai.com profile is authenticated")
 	s.mu.Lock()
 	s.Status = "captured"
 	s.UpdatedAt = nowISO()
