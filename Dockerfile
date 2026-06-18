@@ -9,6 +9,9 @@ RUN CGO_ENABLED=0 go build -o /out/kling-creator-01 .
 
 FROM chromedp/headless-shell:latest
 WORKDIR /app
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends fonts-noto-cjk \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /out/kling-creator-01 /app/kling-creator-01
 ENV HOST=0.0.0.0 \
     PORT=18013 \
