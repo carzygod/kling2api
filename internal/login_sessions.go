@@ -192,8 +192,30 @@ func (s *LoginSession) OpenQRCodeLogin() error {
 		chromedp.KeyEvent("\u001b"),
 		chromedp.Sleep(400*time.Millisecond),
 		chromedp.MouseClickXY(38, 736),
-		chromedp.Sleep(1800*time.Millisecond),
-		chromedp.MouseClickXY(906, 336),
+		chromedp.Sleep(3200*time.Millisecond),
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			var clicked bool
+			script := `(() => {
+				const visible = el => {
+					const r = el.getBoundingClientRect();
+					return r.width > 0 && r.height > 0;
+				};
+				const tabs = Array.from(document.querySelectorAll('*'))
+					.filter(el => visible(el) && (el.textContent || '').trim() === '扫码登录');
+				if (tabs[0]) {
+					tabs[0].click();
+					return true;
+				}
+				return false;
+			})()`
+			if err := chromedp.Evaluate(script, &clicked).Do(ctx); err != nil {
+				return err
+			}
+			if clicked {
+				return nil
+			}
+			return chromedp.MouseClickXY(904, 342).Do(ctx)
+		}),
 		chromedp.Sleep(2500*time.Millisecond),
 	)
 	if err != nil {
