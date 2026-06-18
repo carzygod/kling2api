@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -267,6 +268,7 @@ func (s *LoginSession) Capture(name string) (*AccountRecord, error) {
 				"https://www.klingai.com/",
 				"https://klingai.com/app",
 				"https://app.klingai.com/",
+				"https://id.klingai.com/",
 			}).Do(ctx)
 			return err
 		}),
@@ -351,11 +353,17 @@ func testKlingAccount(a *AccountRecord) (bool, string) {
 	if a == nil || a.CookieString == "" {
 		return false, "empty cookie string"
 	}
-	req, err := http.NewRequest(http.MethodGet, Cfg.LoginURL, nil)
+	if ok, message := hasFreshTaskCookies(a.CookieJSON); !ok {
+		return false, message
+	}
+	req, err := http.NewRequest(http.MethodGet, "https://klingai.com/api/user/profile_and_features", nil)
 	if err != nil {
 		return false, err.Error()
 	}
 	req.Header.Set("Cookie", a.CookieString)
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+	req.Header.Set("Referer", "https://klingai.com/app")
 	if a.UserAgent != "" {
 		req.Header.Set("User-Agent", a.UserAgent)
 	}
@@ -365,8 +373,64 @@ func testKlingAccount(a *AccountRecord) (bool, string) {
 		return false, err.Error()
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= 500 {
-		return false, fmt.Sprintf("klingai.com returned HTTP %d", resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return false, fmt.Sprintf("klingai.com profile returned HTTP %d: %s", resp.StatusCode, trimBody(body))
 	}
-	return true, fmt.Sprintf("klingai.com returned HTTP %d; cookie transport is accepted", resp.StatusCode)
+	var out map[string]interface{}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return false, fmt.Sprintf("decode kling profile failed: %v; body=%s", err, trimBody(body))
+	}
+	if hasKlingUserProfile(out) {
+		return true, "klingai.com profile is authenticated"
+	}
+	return false, fmt.Sprintf("klingai.com profile did not include authenticated user: %s", trimBody(body))
+}
+
+func hasKlingUserProfile(out map[string]interface{}) bool {
+	if out == nil {
+		return false
+	}
+	if profile, ok := out["userProfile"].(map[string]interface{}); ok && len(profile) > 0 {
+		return true
+	}
+	if user, ok := out["user"].(map[string]interface{}); ok && len(user) > 0 {
+		return true
+	}
+	if data, ok := out["data"].(map[string]interface{}); ok {
+		if profile, ok := data["userProfile"].(map[string]interface{}); ok && len(profile) > 0 {
+			return true
+		}
+		if user, ok := data["user"].(map[string]interface{}); ok && len(user) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func hasFreshTaskCookies(cookieJSON string) (bool, string) {
+	var cookies []capturedCookie
+	if strings.TrimSpace(cookieJSON) == "" {
+		return true, ""
+	}
+	if err := json.Unmarshal([]byte(cookieJSON), &cookies); err != nil {
+		return true, ""
+	}
+	required := map[string]bool{"kwscode": false, "kwssectoken": false}
+	now := float64(time.Now().Unix())
+	for _, cookie := range cookies {
+		if _, ok := required[cookie.Name]; !ok {
+			continue
+		}
+		if cookie.Expires > 0 && cookie.Expires <= now+60 {
+			return false, cookie.Name + " is expired; please re-login and capture the Kling account again"
+		}
+		required[cookie.Name] = true
+	}
+	for name, seen := range required {
+		if !seen {
+			return false, name + " is missing; please re-login and capture the Kling account again"
+		}
+	}
+	return true, ""
 }

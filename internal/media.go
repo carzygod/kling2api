@@ -30,6 +30,7 @@ type mediaGenerationRequest struct {
 	N               int                    `json:"n"`
 	Count           int                    `json:"count"`
 	Size            string                 `json:"size"`
+	Resolution      string                 `json:"resolution"`
 	AspectRatio     string                 `json:"aspect_ratio"`
 	Ratio           string                 `json:"ratio"`
 	Image           string                 `json:"image"`
@@ -280,10 +281,6 @@ func newKlingClient(account *AccountRecord) (*klingClient, error) {
 	}
 	baseURL := "https://klingai.com/"
 	uploadBase := "https://upload.uvfuns.com/"
-	if strings.Contains(account.CookieString, "kuaishou") {
-		baseURL = "https://klingai.kuaishou.com/"
-		uploadBase = "https://upload.kuaishouzt.com/"
-	}
 	return &klingClient{
 		account:    account,
 		httpClient: &http.Client{Timeout: 60 * time.Second, Transport: transport},
@@ -327,16 +324,18 @@ func (c *klingClient) buildImagePayload(ctx context.Context, req mediaGeneration
 		if err != nil {
 			return nil, err
 		}
+		version := kolorsVersion(req.Model)
 		args := []map[string]interface{}{
 			{"name": "prompt", "value": req.Prompt},
 			{"name": "style", "value": "默认"},
 			{"name": "aspect_ratio", "value": ratio},
-			{"name": "imageCount", "value": count},
+			{"name": "imageCount", "value": strconv.Itoa(count)},
+			{"name": "kolors_version", "value": version},
 			{"name": "fidelity", "value": "0.5"},
 			{"name": "biz", "value": "klingai"},
 		}
-		if strings.Contains(req.Model, "v2") {
-			args = append(args, map[string]interface{}{"name": "model_name", "value": req.Model})
+		if version == "2.0" || version == "2.1" {
+			args = append(args, map[string]interface{}{"name": "img_resolution", "value": imageResolution(req)})
 		}
 		return map[string]interface{}{
 			"type": "mmu_img2img_aiweb",
@@ -346,15 +345,17 @@ func (c *klingClient) buildImagePayload(ctx context.Context, req mediaGeneration
 			"arguments": args,
 		}, nil
 	}
+	version := kolorsVersion(req.Model)
 	args := []map[string]interface{}{
 		{"name": "prompt", "value": req.Prompt},
 		{"name": "style", "value": "默认"},
 		{"name": "aspect_ratio", "value": ratio},
-		{"name": "imageCount", "value": count},
+		{"name": "imageCount", "value": strconv.Itoa(count)},
+		{"name": "kolors_version", "value": version},
 		{"name": "biz", "value": "klingai"},
 	}
-	if strings.Contains(req.Model, "v2") {
-		args = append(args, map[string]interface{}{"name": "model_name", "value": req.Model})
+	if version == "2.0" || version == "2.1" {
+		args = append(args, map[string]interface{}{"name": "img_resolution", "value": imageResolution(req)})
 	}
 	return map[string]interface{}{
 		"type":      "mmu_txt2img_aiweb",
@@ -535,23 +536,97 @@ func (c *klingClient) buildVideoPayload(ctx context.Context, req mediaGeneration
 
 func (c *klingClient) submit(ctx context.Context, payload map[string]interface{}) (string, map[string]interface{}, error) {
 	var out map[string]interface{}
-	if err := c.doJSON(ctx, http.MethodPost, c.baseURL+"api/task/submit", payload, &out); err != nil {
-		return "", nil, err
+	directErr := c.doJSON(ctx, http.MethodPost, c.baseURL+"api/task/submit", payload, &out)
+	if directErr == nil {
+		if id := taskIDFromSubmitResponse(out); id != "" {
+			return id, out, nil
+		}
+		if browserOut, err := c.submitWithBrowser(ctx, payload); err == nil {
+			if id := taskIDFromSubmitResponse(browserOut); id != "" {
+				return id, browserOut, nil
+			}
+			if signedURL := stringFromAny(browserOut["_signed_url"]); signedURL != "" {
+				signedOut, err := c.submitSigned(ctx, signedURL, stringFromAny(browserOut["_signed_body"]), payload)
+				if err != nil {
+					return "", signedOut, err
+				}
+				if id := taskIDFromSubmitResponse(signedOut); id != "" {
+					return id, signedOut, nil
+				}
+				return "", signedOut, fmt.Errorf("Kling signed response did not include task id: %s", trimBody([]byte(mustJSON(signedOut))))
+			}
+			return "", browserOut, fmt.Errorf("Kling browser response did not include task id: %s", trimBody([]byte(mustJSON(browserOut))))
+		} else {
+			return "", out, fmt.Errorf("Kling direct response did not include task id: %s; browser fallback failed: %w", trimBody([]byte(mustJSON(out))), err)
+		}
+	} else {
+		if browserOut, err := c.submitWithBrowser(ctx, payload); err == nil {
+			if id := taskIDFromSubmitResponse(browserOut); id != "" {
+				return id, browserOut, nil
+			}
+			if signedURL := stringFromAny(browserOut["_signed_url"]); signedURL != "" {
+				signedOut, err := c.submitSigned(ctx, signedURL, stringFromAny(browserOut["_signed_body"]), payload)
+				if err != nil {
+					return "", signedOut, err
+				}
+				if id := taskIDFromSubmitResponse(signedOut); id != "" {
+					return id, signedOut, nil
+				}
+				return "", signedOut, fmt.Errorf("Kling signed response did not include task id: %s", trimBody([]byte(mustJSON(signedOut))))
+			}
+			return "", browserOut, fmt.Errorf("Kling browser response did not include task id: %s", trimBody([]byte(mustJSON(browserOut))))
+		} else {
+			return "", nil, fmt.Errorf("Kling direct submit failed: %v; browser submit failed: %w", directErr, err)
+		}
+	}
+	return "", out, fmt.Errorf("Kling response did not include task id: %s", trimBody([]byte(mustJSON(out))))
+}
+
+func (c *klingClient) submitSigned(ctx context.Context, signedURL, signedBody string, payload map[string]interface{}) (map[string]interface{}, error) {
+	endpoint := signedURL
+	if strings.HasPrefix(endpoint, "/") {
+		endpoint = c.baseURL + strings.TrimPrefix(endpoint, "/")
+	}
+	var out map[string]interface{}
+	var body io.Reader
+	if signedBody != "" {
+		body = strings.NewReader(signedBody)
+	} else {
+		b, err := json.Marshal(payload)
+		if err != nil {
+			return nil, err
+		}
+		body = bytes.NewReader(b)
+	}
+	if err := c.doJSONWithContent(ctx, http.MethodPost, endpoint, body, "application/json", &out); err != nil {
+		return out, err
+	}
+	return out, nil
+}
+
+func taskIDFromSubmitResponse(out map[string]interface{}) string {
+	if task, ok := out["task"].(map[string]interface{}); ok {
+		if id := stringFromAny(task["id"]); id != "" {
+			return id
+		}
+	}
+	if id := stringFromAny(out["taskId"]); id != "" {
+		return id
 	}
 	if data, ok := out["data"].(map[string]interface{}); ok {
 		if status := intFromAny(data["status"]); status == 7 {
-			return "", out, fmt.Errorf("Kling rejected request: %s", stringFromAny(data["message"]))
+			return ""
 		}
 		if task, ok := data["task"].(map[string]interface{}); ok {
 			if id := stringFromAny(task["id"]); id != "" {
-				return id, out, nil
+				return id
 			}
 		}
 		if id := stringFromAny(data["taskId"]); id != "" {
-			return id, out, nil
+			return id
 		}
 	}
-	return "", out, errors.New("Kling response did not include task id")
+	return ""
 }
 
 func (c *klingClient) waitForResult(ctx context.Context, upstreamTaskID, taskType string, timeout time.Duration) (map[string]interface{}, error) {
@@ -920,6 +995,31 @@ func klingVersion(model string) string {
 		return "1.5"
 	}
 	return "1.0"
+}
+
+func kolorsVersion(model string) string {
+	model = strings.ToLower(model)
+	if strings.Contains(model, "2.1") || strings.Contains(model, "v2-1") || strings.Contains(model, "v2_1") {
+		return "2.1"
+	}
+	if strings.Contains(model, "2.0") || strings.Contains(model, "v2") {
+		return "2.0"
+	}
+	if strings.Contains(model, "1.5") || strings.Contains(model, "v1-5") || strings.Contains(model, "v1_5") {
+		return "1.5"
+	}
+	return "1.0"
+}
+
+func imageResolution(req mediaGenerationRequest) string {
+	value := strings.ToLower(firstNonEmpty(req.Resolution, req.Size))
+	if strings.Contains(value, "2k") || strings.Contains(value, "2048") {
+		return "2k"
+	}
+	if strings.Contains(value, "4k") || strings.Contains(value, "4096") {
+		return "4k"
+	}
+	return "1k"
 }
 
 func appendVideoOptionalArgs(args []map[string]interface{}, req mediaGenerationRequest) []map[string]interface{} {
