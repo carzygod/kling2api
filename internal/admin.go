@@ -323,10 +323,6 @@ func handleTasksAPI(w http.ResponseWriter, r *http.Request) {
 func writeSessionScreenshot(w http.ResponseWriter, session *LoginSession) {
 	image := session.Screenshot()
 	if len(image) == 0 {
-		_ = session.RefreshScreenshot()
-		image = session.Screenshot()
-	}
-	if len(image) == 0 {
 		writeError(w, http.StatusNotFound, "screenshot_not_ready", "screenshot is not ready")
 		return
 	}

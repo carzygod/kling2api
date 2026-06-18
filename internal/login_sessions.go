@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/chromedp/cdproto/network"
+	cdpPage "github.com/chromedp/cdproto/page"
 	"github.com/chromedp/chromedp"
 	"github.com/google/uuid"
 )
@@ -31,6 +32,7 @@ type LoginSession struct {
 	profile    string
 	screenshot []byte
 	mu         sync.Mutex
+	runMu      sync.Mutex
 }
 
 type LoginSessionManager struct {
@@ -120,10 +122,14 @@ func (m *LoginSessionManager) Delete(id string) bool {
 }
 
 func (s *LoginSession) start() {
-	err := chromedp.Run(s.ctx,
+	s.setStatus("opening")
+	err := s.runBrowser(35*time.Second,
 		network.Enable(),
-		chromedp.Navigate(Cfg.LoginURL),
-		chromedp.Sleep(3*time.Second),
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			_, _, _, _, err := cdpPage.Navigate(Cfg.LoginURL).Do(ctx)
+			return err
+		}),
+		chromedp.Sleep(6*time.Second),
 	)
 	if err != nil {
 		s.setError(err)
@@ -145,17 +151,17 @@ func (s *LoginSession) publicCopy() *LoginSession {
 }
 
 func (s *LoginSession) RefreshScreenshot() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	var image []byte
-	err := chromedp.Run(s.ctx,
+	err := s.runBrowser(20*time.Second,
 		chromedp.Sleep(500*time.Millisecond),
 		chromedp.FullScreenshot(&image, 85),
 	)
 	if err != nil {
-		s.setErrorLocked(err)
+		s.setError(err)
 		return err
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.screenshot = image
 	s.UpdatedAt = nowISO()
 	return nil
@@ -170,7 +176,7 @@ func (s *LoginSession) Screenshot() []byte {
 }
 
 func (s *LoginSession) Click(x, y float64) error {
-	err := chromedp.Run(s.ctx,
+	err := s.runBrowser(20*time.Second,
 		chromedp.MouseClickXY(x, y),
 		chromedp.Sleep(800*time.Millisecond),
 	)
@@ -182,7 +188,7 @@ func (s *LoginSession) Click(x, y float64) error {
 }
 
 func (s *LoginSession) Input(text string) error {
-	err := chromedp.Run(s.ctx,
+	err := s.runBrowser(20*time.Second,
 		chromedp.KeyEvent(text),
 		chromedp.Sleep(800*time.Millisecond),
 	)
@@ -194,9 +200,12 @@ func (s *LoginSession) Input(text string) error {
 }
 
 func (s *LoginSession) Reload() error {
-	err := chromedp.Run(s.ctx,
-		chromedp.Reload(),
-		chromedp.Sleep(2*time.Second),
+	s.setStatus("opening")
+	err := s.runBrowser(35*time.Second,
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			return cdpPage.Reload().Do(ctx)
+		}),
+		chromedp.Sleep(4*time.Second),
 	)
 	if err != nil {
 		s.setError(err)
@@ -212,7 +221,7 @@ func (s *LoginSession) Capture(name string) (*AccountRecord, error) {
 	var cookies []*network.Cookie
 	localStorageJSON := "{}"
 	userAgent := ""
-	err := chromedp.Run(s.ctx,
+	err := s.runBrowser(25*time.Second,
 		chromedp.ActionFunc(func(ctx context.Context) error {
 			var err error
 			cookies, err = network.GetCookies().WithURLs([]string{
@@ -273,6 +282,20 @@ func (s *LoginSession) setErrorLocked(err error) {
 	s.Status = "error"
 	s.LastError = err.Error()
 	s.UpdatedAt = nowISO()
+}
+
+func (s *LoginSession) setStatus(status string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Status = status
+	s.UpdatedAt = nowISO()
+}
+
+func (s *LoginSession) runBrowser(timeout time.Duration, actions ...chromedp.Action) error {
+	s.runMu.Lock()
+	defer s.runMu.Unlock()
+	_ = timeout
+	return chromedp.Run(s.ctx, actions...)
 }
 
 func cookiesToString(cookies []*network.Cookie) string {
