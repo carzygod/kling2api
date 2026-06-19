@@ -658,39 +658,41 @@ func (c *klingClient) fetchResult(ctx context.Context, upstreamTaskID, taskType 
 		return nil, "failed", errors.New("empty upstream task id")
 	}
 	var out map[string]interface{}
-	endpoint := c.baseURL + "api/task/status?taskId=" + url.QueryEscape(upstreamTaskID)
-	if err := c.doJSON(ctx, http.MethodGet, endpoint, nil, &out); err != nil {
-		return nil, "failed", err
-	}
-	data, ok := out["data"].(map[string]interface{})
-	if !ok {
-		return out, "failed", errors.New("Kling status response missing data")
-	}
-	status := intFromAny(data["status"])
-	state := "running"
-	if status >= 90 {
-		state = "succeeded"
-	} else if status == 9 || status == 50 {
-		state = "failed"
-	}
-	urls := []string{}
-	if works, ok := data["works"].([]interface{}); ok {
-		for _, item := range works {
-			work, ok := item.(map[string]interface{})
-			if !ok {
-				continue
-			}
-			resource := nestedString(work, "resource", "resource")
-			if workID := stringFromAny(work["workId"]); workID != "" {
-				if cdnURL, err := c.fetchDownloadURL(ctx, workID, taskType); err == nil && cdnURL != "" {
-					resource = cdnURL
-				}
-			}
-			if resource != "" {
-				urls = append(urls, resource)
+	endpoint := c.baseURL + "api/task/status/batch?taskIds=" + url.QueryEscape(upstreamTaskID)
+	directErr := c.doJSON(ctx, http.MethodGet, endpoint, nil, &out)
+	data, ok := taskStatusData(out, upstreamTaskID)
+	if directErr != nil || !ok {
+		singleEndpoint := c.baseURL + "api/task/status?taskId=" + url.QueryEscape(upstreamTaskID)
+		var singleOut map[string]interface{}
+		if err := c.doJSON(ctx, http.MethodGet, singleEndpoint, nil, &singleOut); err == nil {
+			if singleData, singleOK := taskStatusData(singleOut, upstreamTaskID); singleOK {
+				out = singleOut
+				data = singleData
+				ok = true
 			}
 		}
 	}
+	if !ok {
+		browserOut, err := c.statusWithBrowser(ctx, upstreamTaskID)
+		if err != nil {
+			if directErr != nil {
+				return out, "failed", fmt.Errorf("Kling direct status failed: %v; browser status failed: %w", directErr, err)
+			}
+			return out, "failed", fmt.Errorf("Kling status response missing data: %s; browser status failed: %w", trimBody([]byte(mustJSON(out))), err)
+		}
+		browserData, browserOK := taskStatusData(browserOut, upstreamTaskID)
+		if !browserOK {
+			return browserOut, "failed", fmt.Errorf("Kling browser status response missing task data: %s", trimBody([]byte(mustJSON(browserOut))))
+		}
+		out = browserOut
+		data = browserData
+		ok = true
+	}
+	if !ok {
+		return out, "failed", errors.New("Kling status response missing data")
+	}
+	state := klingTaskState(data)
+	urls := c.urlsFromTaskData(ctx, data, taskType)
 	return map[string]interface{}{
 		"id":       upstreamTaskID,
 		"status":   state,
@@ -706,13 +708,294 @@ func (c *klingClient) fetchDownloadURL(ctx context.Context, workID, taskType str
 		endpoint += "&fileTypes=PNG"
 	}
 	var out map[string]interface{}
-	if err := c.doJSON(ctx, http.MethodGet, endpoint, nil, &out); err != nil {
+	err := c.doJSON(ctx, http.MethodGet, endpoint, nil, &out)
+	if err != nil || !appResponseHasData(out) {
+		if browserOut, browserErr := c.downloadURLWithBrowser(ctx, workID, taskType); browserErr == nil {
+			out = browserOut
+			err = nil
+		}
+	}
+	if err != nil {
 		return "", err
 	}
-	if data, ok := out["data"].(map[string]interface{}); ok {
-		return stringFromAny(data["cdnUrl"]), nil
+	return downloadURLFromResponse(out), nil
+}
+
+func taskStatusData(out map[string]interface{}, upstreamTaskID string) (map[string]interface{}, bool) {
+	if len(out) == 0 {
+		return nil, false
 	}
-	return "", nil
+	if appResponseStatusFailed(out) {
+		return nil, false
+	}
+	data := out["data"]
+	if item, ok := statusDataFromAny(data, upstreamTaskID); ok {
+		return item, true
+	}
+	if hasTaskStatusFields(out) && !looksLikeAppEnvelope(out) {
+		return out, true
+	}
+	for _, key := range []string{"task", "result"} {
+		if item, ok := statusDataFromAny(out[key], upstreamTaskID); ok {
+			return item, true
+		}
+	}
+	return nil, false
+}
+
+func statusDataFromAny(value interface{}, upstreamTaskID string) (map[string]interface{}, bool) {
+	switch typed := value.(type) {
+	case map[string]interface{}:
+		if hasTaskStatusFields(typed) {
+			return typed, true
+		}
+		for _, key := range []string{"task", "result", "detail"} {
+			if item, ok := statusDataFromAny(typed[key], upstreamTaskID); ok {
+				return item, true
+			}
+		}
+		for _, key := range []string{"tasks", "taskList", "task_status_list", "taskStatusList", "list", "items", "records"} {
+			if item, ok := statusDataFromAny(typed[key], upstreamTaskID); ok {
+				return item, true
+			}
+		}
+	case []interface{}:
+		var first map[string]interface{}
+		for _, item := range typed {
+			candidate, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if first == nil {
+				first = candidate
+			}
+			if upstreamTaskID != "" && taskIDMatches(candidate, upstreamTaskID) {
+				return candidate, true
+			}
+		}
+		if first != nil && hasTaskStatusFields(first) {
+			return first, true
+		}
+	}
+	return nil, false
+}
+
+func hasTaskStatusFields(value map[string]interface{}) bool {
+	if value == nil {
+		return false
+	}
+	for _, key := range []string{"taskStatus", "task_status", "state", "works", "workList", "resource", "workId"} {
+		if _, ok := value[key]; ok {
+			return true
+		}
+	}
+	if _, ok := value["status"]; ok && !looksLikeAppEnvelope(value) {
+		return true
+	}
+	return false
+}
+
+func looksLikeAppEnvelope(value map[string]interface{}) bool {
+	if value == nil {
+		return false
+	}
+	_, hasData := value["data"]
+	_, hasResult := value["result"]
+	_, hasTimestamp := value["timestamp"]
+	_, hasMessage := value["message"]
+	_, hasError := value["error"]
+	return hasData && (hasResult || hasTimestamp || hasMessage || hasError)
+}
+
+func appResponseStatusFailed(out map[string]interface{}) bool {
+	if out == nil {
+		return false
+	}
+	if status := intFromAny(out["status"]); status >= 400 {
+		return true
+	}
+	if result := intFromAny(out["result"]); result != 0 && result != 1 {
+		return true
+	}
+	return false
+}
+
+func taskIDMatches(value map[string]interface{}, upstreamTaskID string) bool {
+	for _, key := range []string{"id", "taskId", "task_id", "taskID"} {
+		if stringFromAny(value[key]) == upstreamTaskID {
+			return true
+		}
+	}
+	return false
+}
+
+func klingTaskState(data map[string]interface{}) string {
+	status := intFromAny(firstAny(data, "status", "taskStatus", "task_status"))
+	if status >= 90 {
+		return "succeeded"
+	}
+	if status == 9 || status == 50 {
+		return "failed"
+	}
+	text := strings.ToLower(stringFromAny(firstAny(data, "status", "taskStatus", "task_status", "state")))
+	switch text {
+	case "success", "succeeded", "finished", "finish", "complete", "completed", "done":
+		return "succeeded"
+	case "fail", "failed", "error", "canceled", "cancelled":
+		return "failed"
+	default:
+		return "running"
+	}
+}
+
+func (c *klingClient) urlsFromTaskData(ctx context.Context, data map[string]interface{}, taskType string) []string {
+	seen := map[string]bool{}
+	urls := []string{}
+	add := func(value string) {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			return
+		}
+		seen[value] = true
+		urls = append(urls, value)
+	}
+	for _, work := range workItemsFromTaskData(data) {
+		resource := firstNonEmpty(
+			nestedString(work, "resource", "resource"),
+			nestedString(work, "resource", "url"),
+			nestedString(work, "resource", "cdnUrl"),
+			stringFromAny(work["resource"]),
+			stringFromAny(work["url"]),
+			stringFromAny(work["cdnUrl"]),
+			stringFromAny(work["downloadUrl"]),
+			stringFromAny(work["fileUrl"]),
+		)
+		if workID := firstNonEmpty(stringFromAny(work["workId"]), stringFromAny(work["work_id"]), stringFromAny(work["id"])); workID != "" {
+			if cdnURL, err := c.fetchDownloadURL(ctx, workID, taskType); err == nil && cdnURL != "" {
+				resource = cdnURL
+			}
+		}
+		add(resource)
+	}
+	if len(urls) == 0 {
+		for _, value := range collectMediaURLs(data) {
+			add(value)
+		}
+	}
+	return urls
+}
+
+func workItemsFromTaskData(data map[string]interface{}) []map[string]interface{} {
+	items := []map[string]interface{}{}
+	var collect func(interface{})
+	collect = func(value interface{}) {
+		switch typed := value.(type) {
+		case map[string]interface{}:
+			if _, ok := typed["resource"]; ok {
+				items = append(items, typed)
+				return
+			}
+			if _, ok := typed["workId"]; ok {
+				items = append(items, typed)
+				return
+			}
+			for _, key := range []string{"works", "workList", "items", "list"} {
+				collect(typed[key])
+			}
+		case []interface{}:
+			for _, item := range typed {
+				collect(item)
+			}
+		}
+	}
+	collect(data["works"])
+	collect(data["workList"])
+	collect(data["items"])
+	collect(data["list"])
+	if len(items) == 0 {
+		collect(data)
+	}
+	return items
+}
+
+func collectMediaURLs(value interface{}) []string {
+	urls := []string{}
+	var walk func(interface{})
+	walk = func(item interface{}) {
+		switch typed := item.(type) {
+		case map[string]interface{}:
+			for key, v := range typed {
+				lowerKey := strings.ToLower(key)
+				if strings.Contains(lowerKey, "url") || lowerKey == "resource" || strings.Contains(lowerKey, "cdn") {
+					if s := stringFromAny(v); isLikelyMediaURL(s) {
+						urls = append(urls, s)
+					}
+				}
+				walk(v)
+			}
+		case []interface{}:
+			for _, v := range typed {
+				walk(v)
+			}
+		case string:
+			if isLikelyMediaURL(typed) {
+				urls = append(urls, typed)
+			}
+		}
+	}
+	walk(value)
+	return urls
+}
+
+func isLikelyMediaURL(value string) bool {
+	value = strings.TrimSpace(value)
+	if !strings.HasPrefix(value, "http://") && !strings.HasPrefix(value, "https://") {
+		return false
+	}
+	lower := strings.ToLower(value)
+	return strings.Contains(lower, ".png") || strings.Contains(lower, ".jpg") || strings.Contains(lower, ".jpeg") || strings.Contains(lower, ".webp") || strings.Contains(lower, ".mp4") || strings.Contains(lower, ".mov") || strings.Contains(lower, "kling") || strings.Contains(lower, "kwaicdn")
+}
+
+func appResponseHasData(out map[string]interface{}) bool {
+	if out == nil {
+		return false
+	}
+	data, ok := out["data"]
+	if !ok || data == nil {
+		return false
+	}
+	if status := intFromAny(out["status"]); status >= 400 {
+		return false
+	}
+	return true
+}
+
+func downloadURLFromResponse(out map[string]interface{}) string {
+	if data, ok := out["data"].(map[string]interface{}); ok {
+		if value := firstNonEmpty(
+			stringFromAny(data["cdnUrl"]),
+			stringFromAny(data["url"]),
+			stringFromAny(data["downloadUrl"]),
+			stringFromAny(data["resource"]),
+		); value != "" {
+			return value
+		}
+	}
+	for _, value := range collectMediaURLs(out) {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func firstAny(root map[string]interface{}, keys ...string) interface{} {
+	for _, key := range keys {
+		if value, ok := root[key]; ok {
+			return value
+		}
+	}
+	return nil
 }
 
 func (c *klingClient) prepareMediaURL(ctx context.Context, value, fallbackName string) (string, error) {

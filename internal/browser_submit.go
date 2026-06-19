@@ -32,6 +32,22 @@ type capturedCookie struct {
 }
 
 func (c *klingClient) submitWithBrowser(parent context.Context, payload map[string]interface{}) (map[string]interface{}, error) {
+	return c.requestWithBrowser(parent, "/api/task/submit", "post", payload, nil, "api/task/submit")
+}
+
+func (c *klingClient) statusWithBrowser(parent context.Context, upstreamTaskID string) (map[string]interface{}, error) {
+	return c.requestWithBrowser(parent, "/api/task/status/batch", "get", nil, map[string]interface{}{"taskIds": upstreamTaskID}, "api/task/status/batch")
+}
+
+func (c *klingClient) downloadURLWithBrowser(parent context.Context, workID, taskType string) (map[string]interface{}, error) {
+	params := map[string]interface{}{"workIds": workID}
+	if taskType == "image" {
+		params["fileTypes"] = "PNG"
+	}
+	return c.requestWithBrowser(parent, "/api/works/batch_download_v2", "get", nil, params, "api/works/batch_download_v2")
+}
+
+func (c *klingClient) requestWithBrowser(parent context.Context, apiPath, method string, data, params map[string]interface{}, moduleHint string) (map[string]interface{}, error) {
 	profileRoot := filepath.Join(Cfg.DataDir, "chrome-api-profiles")
 	if err := os.MkdirAll(profileRoot, 0o755); err != nil {
 		return nil, err
@@ -63,7 +79,14 @@ func (c *klingClient) submitWithBrowser(parent context.Context, payload map[stri
 	runCtx, cancelRun := context.WithTimeout(browserCtx, 90*time.Second)
 	defer cancelRun()
 
-	payloadJSON, _ := json.Marshal(payload)
+	dataJSON, _ := json.Marshal(data)
+	if data == nil {
+		dataJSON = []byte("null")
+	}
+	paramsJSON, _ := json.Marshal(params)
+	if params == nil {
+		paramsJSON = []byte("null")
+	}
 	localStorage := c.account.LocalStorageJSON
 	if strings.TrimSpace(localStorage) == "" {
 		localStorage = "{}"
@@ -82,7 +105,7 @@ func (c *klingClient) submitWithBrowser(parent context.Context, payload map[stri
 			return setBrowserCookies(ctx, c.baseURL, c.account.CookieJSON, c.account.CookieString)
 		}),
 		chromedp.ActionFunc(func(ctx context.Context) error {
-			cookies, err := network.GetCookies().WithURLs([]string{c.baseURL, c.baseURL + "app"}).Do(ctx)
+			cookies, err := network.GetCookies().WithURLs([]string{c.baseURL, c.baseURL + "app", "https://id.klingai.com/"}).Do(ctx)
 			if err != nil {
 				return err
 			}
@@ -95,7 +118,7 @@ func (c *klingClient) submitWithBrowser(parent context.Context, payload map[stri
 			return nil
 		}),
 		chromedp.ActionFunc(func(ctx context.Context) error {
-			_, _, _, _, err := cdpPage.Navigate(c.baseURL+"app").Do(ctx)
+			_, _, _, _, err := cdpPage.Navigate(c.baseURL + "app").Do(ctx)
 			return err
 		}),
 		chromedp.Sleep(5*time.Second),
@@ -106,7 +129,7 @@ func (c *klingClient) submitWithBrowser(parent context.Context, payload map[stri
 		chromedp.Sleep(5*time.Second),
 		chromedp.ActionFunc(func(ctx context.Context) error {
 			var err error
-			result, err = evaluateBrowserFetch(ctx, string(payloadJSON), cdpCookieNames)
+			result, err = evaluateBrowserFetch(ctx, apiPath, method, string(dataJSON), string(paramsJSON), moduleHint, cdpCookieNames)
 			return err
 		}),
 	)
@@ -236,21 +259,36 @@ func shouldSkipChromeProfileDir(name string) bool {
 	}
 }
 
-func evaluateBrowserFetch(ctx context.Context, payloadJSON, cdpCookieNames string) (browserFetchResult, error) {
+func evaluateBrowserFetch(ctx context.Context, apiPath, method, dataJSON, paramsJSON, moduleHint, cdpCookieNames string) (browserFetchResult, error) {
 	js := `(async()=>{
 		const cdpCookieNames = JSON.parse(` + strconv.Quote(cdpCookieNames) + `);
 		try {
-			const payload = JSON.parse(` + strconv.Quote(payloadJSON) + `);
+			const apiPath = ` + strconv.Quote(apiPath) + `;
+			const method = ` + strconv.Quote(strings.ToLower(method)) + `;
+			const data = JSON.parse(` + strconv.Quote(dataJSON) + `);
+			const params = JSON.parse(` + strconv.Quote(paramsJSON) + `);
+			const moduleHint = ` + strconv.Quote(moduleHint) + `;
 			const resources = performance.getEntriesByType("resource").map(e=>e.name).filter(name=>name.includes("/assets/js/") && name.endsWith(".js"));
 			let moduleURL = "";
 			for (const url of resources) {
 				try {
 					const text = await fetch(url, {credentials: "omit"}).then(r=>r.ok ? r.text() : "");
-					if (text.includes("api/task/submit") && text.includes("features:{i18n") && text.includes("sig4")) {
+					if (text.includes("sig4") && text.includes("axiosInstance") && (!moduleHint || text.includes(moduleHint))) {
 						moduleURL = url;
 						break;
 					}
 				} catch (_) {}
+			}
+			if (!moduleURL) {
+				for (const url of resources) {
+					try {
+						const text = await fetch(url, {credentials: "omit"}).then(r=>r.ok ? r.text() : "");
+						if (text.includes("sig4") && text.includes("axiosInstance") && text.includes("api/task/submit")) {
+							moduleURL = url;
+							break;
+						}
+					} catch (_) {}
+				}
 			}
 			if (!moduleURL) throw new Error("official Kling api module was not found");
 			const cookieLength = document.cookie.length;
@@ -259,10 +297,11 @@ func evaluateBrowserFetch(ctx context.Context, payloadJSON, cdpCookieNames strin
 			const api = mod.a || mod.default;
 			if (!api || !api.axiosInstance) throw new Error("official Kling api client export was not found");
 			const response = await api.axiosInstance.request({
-				url: "/api/task/submit",
-				method: "post",
-				data: payload,
-				headers: {"Content-Type": "application/json"},
+				url: apiPath,
+				method,
+				data: data === null ? undefined : data,
+				params: params === null ? undefined : params,
+				headers: data === null ? undefined : {"Content-Type": "application/json"},
 				requestOptions: {}
 			});
 			return {status: 200, text: JSON.stringify(response && response.data !== undefined ? response.data : response), href: location.href};
@@ -332,8 +371,9 @@ func setBrowserCookies(ctx context.Context, baseURL, cookieJSON, cookieString st
 		if path == "" {
 			path = "/"
 		}
+		cookieURL := browserCookieURL(baseURL, domain)
 		action := network.SetCookie(item.Name, item.Value).
-			WithURL(baseURL).
+			WithURL(cookieURL).
 			WithDomain(domain).
 			WithPath(path).
 			WithHTTPOnly(item.HTTPOnly).
@@ -351,6 +391,23 @@ func setBrowserCookies(ctx context.Context, baseURL, cookieJSON, cookieString st
 		}
 	}
 	return nil
+}
+
+func browserCookieURL(baseURL, domain string) string {
+	domain = strings.TrimPrefix(strings.TrimSpace(domain), ".")
+	if domain == "" {
+		return baseURL
+	}
+	if strings.Contains(domain, "id.klingai.com") {
+		return "https://id.klingai.com/"
+	}
+	if strings.Contains(domain, "klingai.com") {
+		return "https://klingai.com/"
+	}
+	if strings.Contains(domain, "kwaishou") {
+		return "https://" + domain + "/"
+	}
+	return baseURL
 }
 
 func cookiesFromHeader(cookieString string) []capturedCookie {
