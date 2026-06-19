@@ -49,6 +49,7 @@ type mediaGenerationRequest struct {
 	Seconds         int                    `json:"seconds"`
 	Cfg             interface{}            `json:"cfg"`
 	Mode            string                 `json:"mode"`
+	ModelMode       string                 `json:"model_mode"`
 	Sound           string                 `json:"sound"`
 	GenerateAudio   *bool                  `json:"generate_audio"`
 	CameraJSON      string                 `json:"camera_json"`
@@ -395,6 +396,7 @@ func (c *klingClient) buildVideoPayload(ctx context.Context, req mediaGeneration
 	firstFrame := firstNonEmpty(req.FirstFrameImage, req.ImageURL, req.Image, req.ReferenceImage)
 	lastFrame := req.LastFrameImage
 	actionVideo := firstNonEmpty(req.ActionVideoURL, req.MotionVideoURL, req.VideoURL, req.ActionVideo, req.MotionVideo)
+	omniVideo := isOmniVideoModel(model)
 
 	if strings.Contains(model, "extend") || isExtendRequest(req) {
 		if req.WorkID == "" && req.VideoURL == "" {
@@ -465,6 +467,9 @@ func (c *klingClient) buildVideoPayload(ctx context.Context, req mediaGeneration
 		if highQuality {
 			modelType = "m2v_img2video_hq"
 		}
+		if omniVideo {
+			modelType = "m2v_omni_video"
+		}
 		args := []map[string]interface{}{
 			{"name": "prompt", "value": req.Prompt},
 			{"name": "negative_prompt", "value": negativePrompt},
@@ -474,6 +479,9 @@ func (c *klingClient) buildVideoPayload(ctx context.Context, req mediaGeneration
 			{"name": "tail_image_enabled", "value": "true"},
 			{"name": "camera_json", "value": cameraJSON},
 			{"name": "biz", "value": "klingai"},
+		}
+		if omniVideo {
+			args = append(args, map[string]interface{}{"name": "model_mode", "value": videoModelMode(req, model)})
 		}
 		args = appendVideoOptionalArgs(args, req)
 		return map[string]interface{}{
@@ -495,6 +503,9 @@ func (c *klingClient) buildVideoPayload(ctx context.Context, req mediaGeneration
 		if highQuality {
 			modelType = "m2v_img2video_hq"
 		}
+		if omniVideo {
+			modelType = "m2v_omni_video"
+		}
 		args := []map[string]interface{}{
 			{"name": "prompt", "value": req.Prompt},
 			{"name": "negative_prompt", "value": negativePrompt},
@@ -504,6 +515,9 @@ func (c *klingClient) buildVideoPayload(ctx context.Context, req mediaGeneration
 			{"name": "tail_image_enabled", "value": "false"},
 			{"name": "camera_json", "value": cameraJSON},
 			{"name": "biz", "value": "klingai"},
+		}
+		if omniVideo {
+			args = append(args, map[string]interface{}{"name": "model_mode", "value": videoModelMode(req, model)})
 		}
 		args = appendVideoOptionalArgs(args, req)
 		return map[string]interface{}{
@@ -519,6 +533,9 @@ func (c *klingClient) buildVideoPayload(ctx context.Context, req mediaGeneration
 	if highQuality {
 		modelType = "m2v_txt2video_hq"
 	}
+	if omniVideo {
+		modelType = "m2v_omni_video"
+	}
 	args := []map[string]interface{}{
 		{"name": "prompt", "value": req.Prompt},
 		{"name": "negative_prompt", "value": negativePrompt},
@@ -528,6 +545,9 @@ func (c *klingClient) buildVideoPayload(ctx context.Context, req mediaGeneration
 		{"name": "aspect_ratio", "value": ratio},
 		{"name": "camera_json", "value": cameraJSON},
 		{"name": "biz", "value": "klingai"},
+	}
+	if omniVideo {
+		args = append(args, map[string]interface{}{"name": "model_mode", "value": videoModelMode(req, model)})
 	}
 	args = appendVideoOptionalArgs(args, req)
 	return map[string]interface{}{
@@ -1249,9 +1269,14 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
+func isOmniVideoModel(model string) bool {
+	model = strings.ToLower(strings.TrimSpace(model))
+	return strings.Contains(model, "omni") || strings.Contains(model, "v3") || strings.Contains(model, "3.0")
+}
+
 func klingVersion(model string) string {
-	if strings.Contains(model, "v3") || strings.Contains(model, "3.0") {
-		return "3.0"
+	if isOmniVideoModel(model) {
+		return "3.0-omni"
 	}
 	if strings.Contains(model, "v2-6") || strings.Contains(model, "2.6") {
 		return "2.6"
@@ -1328,6 +1353,21 @@ func appendVideoOptionalArgs(args []map[string]interface{}, req mediaGenerationR
 		args = append(args, map[string]interface{}{"name": "generate_audio", "value": value})
 	}
 	return args
+}
+
+func videoModelMode(req mediaGenerationRequest, model string) string {
+	value := strings.ToLower(firstNonEmpty(req.ModelMode, req.Resolution, req.Mode, req.Size))
+	model = strings.ToLower(model)
+	switch {
+	case strings.Contains(value, "4k") || strings.Contains(value, "2160") || strings.Contains(model, "4k"):
+		return "4k"
+	case strings.Contains(value, "2k") || strings.Contains(value, "1440") || strings.Contains(model, "2k"):
+		return "2k"
+	case strings.Contains(value, "1080") || strings.Contains(value, "nice") || strings.Contains(value, "pro"):
+		return "1080p"
+	default:
+		return "720p"
+	}
 }
 
 func cfgString(value interface{}) string {
