@@ -135,6 +135,15 @@ Supported image input forms:
 
 ## Video Generation
 
+Video task responses are aligned with `QIANWEN-CREATOR-01`:
+
+- `object`: `video.generation.task`
+- `status`: `queued`, `running`, `completed`, `failed`, or `cancelled`
+- task id fields: `id` and `task_id`
+- polling field: `poll_url`
+- local cancellation at `POST /v1/video/generations/{task_id}/cancel` and `POST /v1/videos/generations/{task_id}/cancel`
+- result URL fields: `data[0].url`, `data[0].video_url`, `url`, and `video_url`
+
 Asynchronous text to video:
 
 ```bash

@@ -232,6 +232,32 @@ func (s *Store) SetTaskResult(id, status string, result interface{}, errorCode, 
 	return err
 }
 
+func (s *Store) CancelTask(id string) error {
+	now := nowISO()
+	res, err := s.db.Exec(`UPDATE kling_tasks
+		SET status='cancelled', error_code='cancelled', error_message='Task was cancelled locally.', updated_at=?, completed_at=COALESCE(NULLIF(completed_at, ''), ?)
+		WHERE id=? AND status NOT IN ('succeeded', 'failed', 'cancelled')`,
+		now, now, id)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected > 0 {
+		return nil
+	}
+	var exists int
+	if err := s.db.QueryRow(`SELECT 1 FROM kling_tasks WHERE id=?`, id).Scan(&exists); err != nil {
+		if err == sql.ErrNoRows {
+			return sql.ErrNoRows
+		}
+		return err
+	}
+	return nil
+}
+
 func (s *Store) GetTask(id string) (*TaskRecord, error) {
 	var t TaskRecord
 	err := s.db.QueryRow(`SELECT id, type, status, model, provider_account_id, upstream_task_id, request_json, response_json, result_json, error_code, error_message, created_at, updated_at, COALESCE(completed_at, '')

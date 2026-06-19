@@ -159,11 +159,20 @@ func HandleVideoGenerationsSync(w http.ResponseWriter, r *http.Request) {
 }
 
 func HandleVideoTask(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "use GET")
+	if !requireAPIKey(w, r) {
 		return
 	}
-	if !requireAPIKey(w, r) {
+	if strings.HasSuffix(strings.TrimRight(r.URL.Path, "/"), "/cancel") {
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "use POST")
+			return
+		}
+		id := taskIDFromPath(strings.TrimSuffix(strings.TrimRight(r.URL.Path, "/"), "/cancel"))
+		cancelVideoTask(w, id)
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "use GET")
 		return
 	}
 	id := taskIDFromPath(r.URL.Path)
@@ -194,6 +203,27 @@ func respondWithTask(w http.ResponseWriter, r *http.Request, id string) {
 			return
 		}
 		writeError(w, http.StatusBadGateway, "task_refresh_failed", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, taskResponse(task, parseJSONMap(task.ResultJSON)))
+}
+
+func cancelVideoTask(w http.ResponseWriter, id string) {
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "missing_task_id", "task id is required")
+		return
+	}
+	if err := AppStore.CancelTask(id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "task_not_found", "task not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "task_cancel_failed", err.Error())
+		return
+	}
+	task, err := AppStore.GetTask(id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "task_load_failed", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, taskResponse(task, parseJSONMap(task.ResultJSON)))
@@ -245,7 +275,7 @@ func submitMediaTask(ctx context.Context, taskType string, req mediaGenerationRe
 		Status:            "queued",
 		Model:             req.Model,
 		ProviderAccountID: account.ID,
-		RequestJSON:       mustJSON(payload),
+		RequestJSON:       taskRequestJSON(req, payload),
 	})
 	if err != nil {
 		return nil, nil, nil, err
@@ -1135,7 +1165,7 @@ func refreshTaskIfNeeded(ctx context.Context, id string) (*TaskRecord, error) {
 	if err != nil {
 		return nil, err
 	}
-	if task.Status == "succeeded" || task.Status == "failed" || task.UpstreamTaskID == "" {
+	if task.Status == "succeeded" || task.Status == "failed" || task.Status == "cancelled" || task.UpstreamTaskID == "" {
 		return task, nil
 	}
 	account, err := AppStore.GetAccount(task.ProviderAccountID)
@@ -1180,6 +1210,9 @@ func taskResponse(task *TaskRecord, result map[string]interface{}) map[string]in
 	if task == nil {
 		return map[string]interface{}{}
 	}
+	if task.Type == "video" {
+		return videoTaskResponse(task, result)
+	}
 	status := task.Status
 	if result != nil {
 		if s := stringFromAny(result["status"]); s != "" {
@@ -1220,6 +1253,162 @@ func taskResponse(task *TaskRecord, result map[string]interface{}) map[string]in
 			"message": task.ErrorMessage,
 		},
 	}
+}
+
+func videoTaskResponse(task *TaskRecord, result map[string]interface{}) map[string]interface{} {
+	status := normalizedVideoTaskStatus(task.Status)
+	if result != nil {
+		if s := stringFromAny(result["status"]); s != "" {
+			status = normalizedVideoTaskStatus(s)
+		}
+	}
+	data := videoTaskData(result)
+	resp := map[string]interface{}{
+		"id":                  task.ID,
+		"task_id":             task.ID,
+		"object":              "video.generation.task",
+		"created":             parseUnix(task.CreatedAt),
+		"updated":             parseUnix(task.UpdatedAt),
+		"model":               task.Model,
+		"provider":            "KLING-CREATOR-01",
+		"status":              status,
+		"poll_url":            "/v1/video/generations/" + task.ID,
+		"account_id":          task.ProviderAccountID,
+		"provider_account_id": task.ProviderAccountID,
+		"provider_task_id":    task.UpstreamTaskID,
+	}
+	if task.CompletedAt != "" {
+		resp["completed"] = parseUnix(task.CompletedAt)
+	}
+	if req := taskRequestMap(task); req != nil {
+		if v, ok := req["duration"]; ok {
+			resp["duration"] = v
+		} else if v, ok := req["duration_seconds"]; ok {
+			resp["duration"] = v
+		} else if v, ok := req["seconds"]; ok {
+			resp["duration"] = v
+		}
+		if v, ok := req["ratio"]; ok {
+			resp["ratio"] = v
+		} else if v, ok := req["aspect_ratio"]; ok {
+			resp["ratio"] = v
+		}
+		if v, ok := req["resolution"]; ok {
+			resp["resolution"] = v
+		}
+		if v, ok := req["model_mode"]; ok {
+			resp["model_mode"] = v
+		}
+	}
+	if len(data) > 0 {
+		resp["data"] = data
+		resp["output"] = data
+		resp["result"] = map[string]interface{}{"data": data}
+		if firstURL := firstVideoURL(data); firstURL != "" {
+			resp["url"] = firstURL
+			resp["video_url"] = firstURL
+		}
+	} else if result != nil {
+		resp["result"] = result
+	}
+	if task.ErrorCode != "" || task.ErrorMessage != "" {
+		resp["error"] = map[string]string{
+			"code":    task.ErrorCode,
+			"message": task.ErrorMessage,
+			"type":    "kling_creator_error",
+		}
+	}
+	return resp
+}
+
+func videoTaskData(result map[string]interface{}) []map[string]string {
+	urls := []interface{}{}
+	if result != nil {
+		if typed, ok := result["urls"].([]interface{}); ok {
+			urls = typed
+		} else if typed, ok := result["urls"].([]string); ok {
+			for _, value := range typed {
+				urls = append(urls, value)
+			}
+		}
+		if len(urls) == 0 {
+			if typed, ok := result["data"].([]interface{}); ok {
+				for _, item := range typed {
+					if object, ok := item.(map[string]interface{}); ok {
+						if value := firstNonEmpty(stringFromAny(object["video_url"]), stringFromAny(object["url"])); value != "" {
+							urls = append(urls, value)
+						}
+					}
+				}
+			}
+		}
+	}
+	data := make([]map[string]string, 0, len(urls))
+	for _, item := range urls {
+		if value := stringFromAny(item); value != "" {
+			data = append(data, map[string]string{"url": value, "video_url": value})
+		}
+	}
+	return data
+}
+
+func normalizedVideoTaskStatus(status string) string {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "processing", "running", "in_progress":
+		return "running"
+	case "succeeded", "success", "completed", "complete", "done":
+		return "completed"
+	case "failed", "fail", "error":
+		return "failed"
+	case "cancelled", "canceled":
+		return "cancelled"
+	default:
+		return "queued"
+	}
+}
+
+func firstVideoURL(data []map[string]string) string {
+	if len(data) == 0 {
+		return ""
+	}
+	for _, key := range []string{"video_url", "url"} {
+		if value := data[0][key]; strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func taskRequestMap(task *TaskRecord) map[string]interface{} {
+	if task == nil || strings.TrimSpace(task.RequestJSON) == "" {
+		return nil
+	}
+	var req map[string]interface{}
+	if json.Unmarshal([]byte(task.RequestJSON), &req) != nil {
+		return nil
+	}
+	return req
+}
+
+func taskRequestJSON(req mediaGenerationRequest, payload map[string]interface{}) string {
+	var out map[string]interface{}
+	raw, err := json.Marshal(req)
+	if err == nil {
+		_ = json.Unmarshal(raw, &out)
+	}
+	if out == nil {
+		out = map[string]interface{}{}
+	}
+	out["upstream_payload"] = payload
+	return mustJSON(out)
+}
+
+func parseUnix(value string) int64 {
+	t, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return time.Now().Unix()
+	}
+	return t.Unix()
 }
 
 type mediaError struct {
