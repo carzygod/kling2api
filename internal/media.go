@@ -304,6 +304,9 @@ func (c *klingClient) buildPayload(ctx context.Context, taskType string, req med
 }
 
 func (c *klingClient) buildImagePayload(ctx context.Context, req mediaGenerationRequest) (map[string]interface{}, error) {
+	if isUnsupportedImageModel(req.Model) {
+		return nil, mediaError{"unsupported_model", "kling-image-v3 is not mapped yet; Kling 3.0 currently refers to video generation, use kling-v3 or kling-video-3.0 on /v1/videos/generations"}
+	}
 	count := req.Count
 	if count == 0 {
 		count = req.N
@@ -1220,7 +1223,7 @@ func httpStatusForMediaErr(err error) int {
 		switch e.code {
 		case "no_account":
 			return http.StatusFailedDependency
-		case "missing_prompt", "missing_video", "missing_action_video", "missing_first_frame", "unsupported_media_input":
+		case "missing_prompt", "missing_video", "missing_action_video", "missing_first_frame", "unsupported_media_input", "unsupported_model":
 			return http.StatusBadRequest
 		}
 	}
@@ -1278,6 +1281,11 @@ func klingVersion(model string) string {
 		return "1.5"
 	}
 	return "1.0"
+}
+
+func isUnsupportedImageModel(model string) bool {
+	model = strings.ToLower(strings.TrimSpace(model))
+	return strings.Contains(model, "image") && (strings.Contains(model, "v3") || strings.Contains(model, "3.0"))
 }
 
 func kolorsVersion(model string) string {

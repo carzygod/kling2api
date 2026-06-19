@@ -76,7 +76,11 @@ func (c *klingClient) requestWithBrowser(parent context.Context, apiPath, method
 	browserCtx, cancelBrowser := chromedp.NewContext(allocCtx)
 	defer cancelBrowser()
 
-	runCtx, cancelRun := context.WithTimeout(browserCtx, 90*time.Second)
+	runTimeout := 120 * time.Second
+	if isSlowSubmitPayload(data) {
+		runTimeout = 240 * time.Second
+	}
+	runCtx, cancelRun := context.WithTimeout(browserCtx, runTimeout)
 	defer cancelRun()
 
 	dataJSON, _ := json.Marshal(data)
@@ -144,6 +148,11 @@ func (c *klingClient) requestWithBrowser(parent context.Context, apiPath, method
 		return nil, fmt.Errorf("decode Kling browser JSON failed: %w; body=%s", err, result.Text)
 	}
 	return out, nil
+}
+
+func isSlowSubmitPayload(data map[string]interface{}) bool {
+	taskType := strings.ToLower(stringFromAny(data["type"]))
+	return strings.Contains(taskType, "video") || strings.Contains(taskType, "m2v")
 }
 
 func (c *klingClient) prepareSubmitProfile(profileRoot string) (string, bool, error) {
