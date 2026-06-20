@@ -177,8 +177,8 @@ func (s *Store) SelectRunnableAccount(accountID string) (*AccountRecord, error) 
 	var enabled int
 	err := s.db.QueryRow(`SELECT id, name, status, enabled, cookie_json, cookie_string, local_storage_json, user_agent, proxy_url, last_error, last_test_at, last_success_at, created_at, updated_at
 		FROM kling_accounts
-		WHERE enabled=1 AND COALESCE(cookie_string, '') <> ''
-		ORDER BY CASE status WHEN 'valid' THEN 0 WHEN 'captured' THEN 1 WHEN 'imported' THEN 2 ELSE 3 END, updated_at DESC
+		WHERE enabled=1 AND COALESCE(cookie_string, '') <> '' AND status IN ('valid', 'captured')
+		ORDER BY CASE status WHEN 'valid' THEN 0 WHEN 'captured' THEN 1 ELSE 2 END, updated_at DESC
 		LIMIT 1`).
 		Scan(&a.ID, &a.Name, &a.Status, &enabled, &a.CookieJSON, &a.CookieString, &a.LocalStorageJSON, &a.UserAgent, &a.ProxyURL, &a.LastError, &a.LastTestAt, &a.LastSuccessAt, &a.CreatedAt, &a.UpdatedAt)
 	if err != nil {
@@ -192,6 +192,7 @@ func (s *Store) DeleteAccount(id string) error {
 	_, err := s.db.Exec(`DELETE FROM kling_accounts WHERE id=?`, id)
 	if err == nil {
 		_ = s.AddEvent(id, "deleted", "account deleted", nil)
+		_ = removeAccountChromeProfile(id)
 	}
 	return err
 }
@@ -299,6 +300,24 @@ func (s *Store) SetAccountTestResult(id string, ok bool, message string) error {
 	}
 	_, err := s.db.Exec(`UPDATE kling_accounts SET status=?, last_error=?, last_test_at=?, last_success_at=COALESCE(NULLIF(?, ''), last_success_at), updated_at=? WHERE id=?`,
 		status, message, nowISO(), successAt, nowISO(), id)
+	return err
+}
+
+func (s *Store) UpdateAccountSessionSnapshot(id, cookieJSON, cookieString, localStorageJSON, userAgent string) error {
+	if id == "" {
+		return nil
+	}
+	if cookieString == "" && cookieJSON == "" && localStorageJSON == "" && userAgent == "" {
+		return nil
+	}
+	_, err := s.db.Exec(`UPDATE kling_accounts
+		SET cookie_json=COALESCE(NULLIF(?, ''), cookie_json),
+			cookie_string=COALESCE(NULLIF(?, ''), cookie_string),
+			local_storage_json=COALESCE(NULLIF(?, ''), local_storage_json),
+			user_agent=COALESCE(NULLIF(?, ''), user_agent),
+			updated_at=?
+		WHERE id=?`,
+		cookieJSON, cookieString, localStorageJSON, userAgent, nowISO(), id)
 	return err
 }
 

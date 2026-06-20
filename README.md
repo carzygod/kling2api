@@ -59,6 +59,55 @@ docker run -d --name kling-creator-01 \
 3. Complete Kling login in the screenshot flow.
 4. Capture the logged-in session.
 5. The service stores cookies, cookie string, localStorage JSON, and user-agent in SQLite.
+6. The service copies the captured Chromium profile to `/data/account-chrome-profiles/{account_id}`.
+
+## Persistent Session Storage
+
+Kling sessions are no longer only static cookie snapshots. Every validated account can have a persistent Chromium user profile:
+
+- Persistent profiles live in `/data/account-chrome-profiles/{account_id}`.
+- API requests prefer the persistent profile when it exists.
+- After each browser-backed upstream request, the service refreshes cookies, localStorage, and user-agent back into SQLite.
+- A keepalive worker retests enabled accounts about every 45 minutes and marks invalid accounts as `invalid`.
+- Startup cleanup removes only transient directories, `/data/chrome-api-profiles` and `/data/chrome-profiles`; it does not delete `/data/account-chrome-profiles`.
+
+If QR login does not complete on the server-side browser, import cookies from a local logged-in browser. Open `https://klingai.com/app`, then run this in Chrome DevTools Console:
+
+```js
+(() => {
+  const cookies = Object.fromEntries(
+    document.cookie.split("; ").filter(Boolean).map((item) => {
+      const index = item.indexOf("=");
+      if (index < 0) return [item, ""];
+      return [item.slice(0, index), decodeURIComponent(item.slice(index + 1))];
+    }),
+  );
+  const localStorageJSON = Object.fromEntries(
+    Array.from({ length: localStorage.length }, (_, i) => {
+      const key = localStorage.key(i);
+      return [key, localStorage.getItem(key)];
+    }),
+  );
+  const payload = {
+    cookies,
+    cookieString: document.cookie,
+    localStorageJSON,
+    userAgent: navigator.userAgent,
+    href: location.href,
+  };
+  console.log(JSON.stringify(payload, null, 2));
+  copy(JSON.stringify(payload, null, 2));
+})();
+```
+
+For admin import:
+
+- Paste `cookieString` into `Cookie Header`, or paste the whole `cookies` object into `Cookie JSON`.
+- Paste `localStorageJSON` into `LocalStorage JSON`.
+- Paste `userAgent` into `User-Agent`.
+- Saving the account immediately boots a server-side persistent Chromium profile and requests Kling's profile endpoint. The account becomes `valid` only if the profile response includes an authenticated user.
+
+Chrome Console cannot read HttpOnly cookies. If imported cookies fail validation, open DevTools Network, click a Kling request such as `/api/user/profile_and_features`, copy the full request `Cookie` header, and paste that into `Cookie Header`.
 
 Admin APIs require `?key=<KLING_CREATOR_ADMIN_KEY>`, `X-Admin-Key`, or `Authorization: Bearer <KLING_CREATOR_ADMIN_KEY>`.
 

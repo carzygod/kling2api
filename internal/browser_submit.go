@@ -48,15 +48,25 @@ func (c *klingClient) downloadURLWithBrowser(parent context.Context, workID, tas
 }
 
 func (c *klingClient) requestWithBrowser(parent context.Context, apiPath, method string, data, params map[string]interface{}, moduleHint string) (map[string]interface{}, error) {
+	unlock := lockAccountChromeProfile(c.account.ID)
+	defer unlock()
+
 	profileRoot := filepath.Join(Cfg.DataDir, "chrome-api-profiles")
 	if err := os.MkdirAll(profileRoot, 0o755); err != nil {
 		return nil, err
 	}
-	profile, _, err := c.prepareSubmitProfile(profileRoot)
-	if err != nil {
-		return nil, err
+	profile := ""
+	usesPersistentProfile := accountChromeProfileExists(c.account.ID)
+	if usesPersistentProfile {
+		profile = accountChromeProfilePath(c.account.ID)
+	} else {
+		var err error
+		profile, _, err = c.prepareSubmitProfile(profileRoot)
+		if err != nil {
+			return nil, err
+		}
+		defer os.RemoveAll(profile)
 	}
-	defer os.RemoveAll(profile)
 
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.ExecPath(Cfg.ChromeExec),
@@ -97,7 +107,10 @@ func (c *klingClient) requestWithBrowser(parent context.Context, apiPath, method
 	}
 	var result browserFetchResult
 	cdpCookieNames := "[]"
-	err = chromedp.Run(runCtx,
+	var refreshedCookies []*network.Cookie
+	refreshedLocalStorage := ""
+	refreshedUserAgent := ""
+	actions := []chromedp.Action{
 		network.Enable(),
 		chromedp.ActionFunc(func(ctx context.Context) error {
 			headers := network.Headers{
@@ -105,11 +118,33 @@ func (c *klingClient) requestWithBrowser(parent context.Context, apiPath, method
 			}
 			return network.SetExtraHTTPHeaders(headers).Do(ctx)
 		}),
+	}
+	if !usesPersistentProfile {
+		actions = append(actions,
+			chromedp.ActionFunc(func(ctx context.Context) error {
+				return setBrowserCookies(ctx, c.baseURL, c.account.CookieJSON, c.account.CookieString)
+			}),
+		)
+	}
+	actions = append(actions,
 		chromedp.ActionFunc(func(ctx context.Context) error {
-			return setBrowserCookies(ctx, c.baseURL, c.account.CookieJSON, c.account.CookieString)
+			_, _, _, _, err := cdpPage.Navigate(c.baseURL + "app").Do(ctx)
+			return err
 		}),
+		chromedp.Sleep(5*time.Second),
+	)
+	if !usesPersistentProfile {
+		actions = append(actions,
+			chromedp.Evaluate(`(()=>{const data=JSON.parse(`+strconv.Quote(localStorage)+`||"{}"); for (const [k,v] of Object.entries(data)) localStorage.setItem(k, String(v)); return true;})()`, nil),
+			chromedp.ActionFunc(func(ctx context.Context) error {
+				return cdpPage.Reload().Do(ctx)
+			}),
+			chromedp.Sleep(5*time.Second),
+		)
+	}
+	actions = append(actions,
 		chromedp.ActionFunc(func(ctx context.Context) error {
-			cookies, err := network.GetCookies().WithURLs([]string{c.baseURL, c.baseURL + "app", "https://id.klingai.com/"}).Do(ctx)
+			cookies, err := network.GetCookies().WithURLs(klingCookieURLs(c.baseURL)).Do(ctx)
 			if err != nil {
 				return err
 			}
@@ -122,23 +157,31 @@ func (c *klingClient) requestWithBrowser(parent context.Context, apiPath, method
 			return nil
 		}),
 		chromedp.ActionFunc(func(ctx context.Context) error {
-			_, _, _, _, err := cdpPage.Navigate(c.baseURL + "app").Do(ctx)
-			return err
-		}),
-		chromedp.Sleep(5*time.Second),
-		chromedp.Evaluate(`(()=>{const data=JSON.parse(`+strconv.Quote(localStorage)+`||"{}"); for (const [k,v] of Object.entries(data)) localStorage.setItem(k, String(v)); return true;})()`, nil),
-		chromedp.ActionFunc(func(ctx context.Context) error {
-			return cdpPage.Reload().Do(ctx)
-		}),
-		chromedp.Sleep(5*time.Second),
-		chromedp.ActionFunc(func(ctx context.Context) error {
 			var err error
 			result, err = evaluateBrowserFetch(ctx, apiPath, method, string(dataJSON), string(paramsJSON), moduleHint, cdpCookieNames)
 			return err
 		}),
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			var err error
+			refreshedCookies, err = network.GetCookies().WithURLs(klingCookieURLs(c.baseURL)).Do(ctx)
+			return err
+		}),
+		chromedp.Evaluate(`JSON.stringify(Object.fromEntries(Object.entries(localStorage)))`, &refreshedLocalStorage),
+		chromedp.Evaluate(`navigator.userAgent`, &refreshedUserAgent),
 	)
+	err := chromedp.Run(runCtx, actions...)
 	if err != nil {
 		return nil, err
+	}
+	cookieString := cookiesToString(refreshedCookies)
+	cookieJSON := ""
+	if len(refreshedCookies) > 0 {
+		if b, err := json.Marshal(refreshedCookies); err == nil {
+			cookieJSON = string(b)
+		}
+	}
+	if err := AppStore.UpdateAccountSessionSnapshot(c.account.ID, cookieJSON, cookieString, refreshedLocalStorage, refreshedUserAgent); err != nil {
+		LogError("failed to update Kling account session snapshot: %v", err)
 	}
 	if result.Status < 200 || result.Status >= 300 {
 		return nil, fmt.Errorf("Kling browser HTTP %d: %s", result.Status, result.Text)
@@ -356,14 +399,22 @@ type browserFetchResult struct {
 	Href   string `json:"href"`
 }
 
+func klingCookieURLs(baseURL string) []string {
+	urls := []string{
+		"https://klingai.com/",
+		"https://www.klingai.com/",
+		"https://klingai.com/app",
+		"https://app.klingai.com/",
+		"https://id.klingai.com/",
+	}
+	if strings.TrimSpace(baseURL) != "" {
+		urls = append(urls, baseURL, strings.TrimRight(baseURL, "/")+"/app")
+	}
+	return urls
+}
+
 func setBrowserCookies(ctx context.Context, baseURL, cookieJSON, cookieString string) error {
-	var cookies []capturedCookie
-	if strings.TrimSpace(cookieJSON) != "" {
-		_ = json.Unmarshal([]byte(cookieJSON), &cookies)
-	}
-	if len(cookies) == 0 {
-		cookies = cookiesFromHeader(cookieString)
-	}
+	cookies := parseCapturedCookies(cookieJSON, cookieString)
 	if len(cookies) == 0 {
 		return errors.New("no cookies available for browser submit")
 	}
@@ -400,6 +451,178 @@ func setBrowserCookies(ctx context.Context, baseURL, cookieJSON, cookieString st
 		}
 	}
 	return nil
+}
+
+func parseCapturedCookies(cookieJSON, cookieString string) []capturedCookie {
+	var cookies []capturedCookie
+	raw := strings.TrimSpace(cookieJSON)
+	if raw != "" {
+		var value interface{}
+		decoder := json.NewDecoder(strings.NewReader(raw))
+		decoder.UseNumber()
+		if err := decoder.Decode(&value); err == nil {
+			cookies = cookiesFromValue(value)
+		}
+	}
+	if len(cookies) == 0 {
+		cookies = cookiesFromHeader(cookieString)
+	}
+	return normalizeCapturedCookies(cookies)
+}
+
+func normalizeCapturedCookies(cookies []capturedCookie) []capturedCookie {
+	out := make([]capturedCookie, 0, len(cookies))
+	seen := map[string]bool{}
+	for _, item := range cookies {
+		item.Name = strings.TrimSpace(item.Name)
+		if item.Name == "" {
+			continue
+		}
+		if item.Domain == "" {
+			item.Domain = ".klingai.com"
+		}
+		if item.Path == "" {
+			item.Path = "/"
+		}
+		key := item.Name + "\x00" + item.Domain + "\x00" + item.Path
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, item)
+	}
+	return out
+}
+
+func cookiesFromValue(value interface{}) []capturedCookie {
+	switch v := value.(type) {
+	case []interface{}:
+		cookies := make([]capturedCookie, 0, len(v))
+		for _, item := range v {
+			if cookie, ok := cookieFromMap(item); ok {
+				cookies = append(cookies, cookie)
+			}
+		}
+		return cookies
+	case map[string]interface{}:
+		if nested, ok := v["cookies"]; ok {
+			return cookiesFromValue(nested)
+		}
+		if cookie, ok := cookieFromMap(v); ok {
+			return []capturedCookie{cookie}
+		}
+		cookies := make([]capturedCookie, 0, len(v))
+		for name, raw := range v {
+			if name == "" {
+				continue
+			}
+			if stringValue, ok := raw.(string); ok {
+				cookies = append(cookies, capturedCookie{Name: name, Value: stringValue, Domain: ".klingai.com", Path: "/"})
+			}
+		}
+		return cookies
+	default:
+		return nil
+	}
+}
+
+func cookieFromMap(value interface{}) (capturedCookie, bool) {
+	item, ok := value.(map[string]interface{})
+	if !ok {
+		return capturedCookie{}, false
+	}
+	name := stringField(item, "name")
+	valueText := stringField(item, "value")
+	if name == "" {
+		return capturedCookie{}, false
+	}
+	cookie := capturedCookie{
+		Name:     name,
+		Value:    valueText,
+		Domain:   firstStringField(item, "domain", "host", "host_key"),
+		Path:     firstStringField(item, "path"),
+		Expires:  firstNumberField(item, "expires", "expirationDate", "expiration_date"),
+		HTTPOnly: boolField(item, "httpOnly", "http_only", "httponly"),
+		Secure:   boolField(item, "secure"),
+		SameSite: normalizeSameSite(firstStringField(item, "sameSite", "same_site", "samesite")),
+	}
+	return cookie, true
+}
+
+func capturedCookiesToHeader(cookies []capturedCookie) string {
+	parts := make([]string, 0, len(cookies))
+	seen := map[string]bool{}
+	for _, item := range normalizeCapturedCookies(cookies) {
+		if item.Name == "" || seen[item.Name] {
+			continue
+		}
+		seen[item.Name] = true
+		parts = append(parts, item.Name+"="+item.Value)
+	}
+	return strings.Join(parts, "; ")
+}
+
+func stringField(item map[string]interface{}, key string) string {
+	if value, ok := item[key]; ok {
+		return strings.TrimSpace(fmt.Sprint(value))
+	}
+	return ""
+}
+
+func firstStringField(item map[string]interface{}, keys ...string) string {
+	for _, key := range keys {
+		if value := stringField(item, key); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func firstNumberField(item map[string]interface{}, keys ...string) float64 {
+	for _, key := range keys {
+		if value, ok := item[key]; ok {
+			switch v := value.(type) {
+			case json.Number:
+				n, _ := v.Float64()
+				return n
+			case float64:
+				return v
+			case int:
+				return float64(v)
+			case string:
+				n, _ := strconv.ParseFloat(strings.TrimSpace(v), 64)
+				return n
+			}
+		}
+	}
+	return 0
+}
+
+func boolField(item map[string]interface{}, keys ...string) bool {
+	for _, key := range keys {
+		if value, ok := item[key]; ok {
+			switch v := value.(type) {
+			case bool:
+				return v
+			case string:
+				parsed, _ := strconv.ParseBool(strings.TrimSpace(v))
+				return parsed
+			}
+		}
+	}
+	return false
+}
+
+func normalizeSameSite(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	switch value {
+	case "no_restriction", "none":
+		return "none"
+	case "lax", "strict":
+		return value
+	default:
+		return ""
+	}
 }
 
 func browserCookieURL(baseURL, domain string) string {

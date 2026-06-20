@@ -3,8 +3,10 @@ package internal
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -295,7 +297,10 @@ func submitMediaTask(ctx context.Context, taskType string, req mediaGenerationRe
 }
 
 func newKlingClient(account *AccountRecord) (*klingClient, error) {
-	if account == nil || strings.TrimSpace(account.CookieString) == "" {
+	if account == nil {
+		return nil, errors.New("empty Kling account")
+	}
+	if strings.TrimSpace(account.CookieString) == "" && !accountChromeProfileExists(account.ID) {
 		return nil, errors.New("empty Kling cookie string")
 	}
 	userAgent := account.UserAgent
@@ -1076,13 +1081,34 @@ func (c *klingClient) prepareMediaURL(ctx context.Context, value, fallbackName s
 
 func (c *klingClient) uploadBytes(ctx context.Context, fileName string, data []byte) (string, error) {
 	var tokenOut map[string]interface{}
+	var directErr error
 	if err := c.doJSON(ctx, http.MethodGet, c.baseURL+"api/upload/issue/token?filename="+url.QueryEscape(fileName), nil, &tokenOut); err != nil {
-		return "", err
+		directErr = err
 	}
-	token := nestedString(tokenOut, "data", "token")
+	token, endpoints := uploadIssueToken(tokenOut)
 	if token == "" {
-		return "", errors.New("upload token not found")
+		browserOut, err := c.issueUploadTokenWithBrowser(ctx, fileName)
+		if err == nil {
+			tokenOut = browserOut
+			token, endpoints = uploadIssueToken(browserOut)
+		} else if directErr != nil {
+			return "", fmt.Errorf("upload token request failed: direct=%v; browser=%v", directErr, err)
+		}
 	}
+	if token == "" {
+		return "", fmt.Errorf("upload token not found: %s", mustJSON(tokenOut))
+	}
+	if len(endpoints) > 0 {
+		return c.uploadBytesWithEndpoints(ctx, token, endpoints, data)
+	}
+	return c.uploadBytesLegacy(ctx, token, data)
+}
+
+func (c *klingClient) issueUploadTokenWithBrowser(ctx context.Context, fileName string) (map[string]interface{}, error) {
+	return c.requestWithBrowser(ctx, "/api/upload/issue/token", "get", nil, map[string]interface{}{"filename": fileName}, "api/upload/issue/token")
+}
+
+func (c *klingClient) uploadBytesLegacy(ctx context.Context, token string, data []byte) (string, error) {
 	var resumeOut map[string]interface{}
 	if err := c.doJSON(ctx, http.MethodGet, c.uploadBase+"api/upload/resume?upload_token="+url.QueryEscape(token), nil, &resumeOut); err != nil {
 		return "", err
@@ -1106,15 +1132,68 @@ func (c *klingClient) uploadBytes(ctx context.Context, fileName string, data []b
 	if intFromAny(completeOut["result"]) != 1 {
 		return "", fmt.Errorf("upload complete failed: %s", mustJSON(completeOut))
 	}
+	return c.verifyUploadedImage(ctx, token)
+}
+
+func (c *klingClient) uploadBytesWithEndpoints(ctx context.Context, token string, endpoints []string, data []byte) (string, error) {
+	sum := md5.Sum(data)
+	contentMD5 := hex.EncodeToString(sum[:])
+	var lastErr error
+	for _, endpoint := range endpoints {
+		endpoint = strings.TrimSpace(endpoint)
+		if endpoint == "" {
+			continue
+		}
+		uploadURL := endpoint
+		if !strings.HasPrefix(uploadURL, "http://") && !strings.HasPrefix(uploadURL, "https://") {
+			uploadURL = "https://" + uploadURL
+		}
+		uploadURL = strings.TrimRight(uploadURL, "/") + "/api/upload"
+		q := url.Values{}
+		q.Set("upload_token", token)
+		q.Set("content_md5", contentMD5)
+		uploadURL += "?" + q.Encode()
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, uploadURL, bytes.NewReader(data))
+		if err != nil {
+			return "", err
+		}
+		req.Header.Set("Content-Type", "application/octet-stream")
+		req.Header.Set("X-File-MD5", contentMD5)
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		respBody, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			lastErr = fmt.Errorf("upload endpoint %s HTTP %d: %s", endpoint, resp.StatusCode, trimBody(respBody))
+			continue
+		}
+		return c.verifyUploadedImage(ctx, token)
+	}
+	if lastErr != nil {
+		return "", lastErr
+	}
+	return "", errors.New("no available upload endpoints")
+}
+
+func (c *klingClient) verifyUploadedImage(ctx context.Context, token string) (string, error) {
 	var verifyOut map[string]interface{}
-	if err := c.doJSON(ctx, http.MethodGet, c.baseURL+"api/upload/verify/token?token="+url.QueryEscape(token), nil, &verifyOut); err != nil {
+	verifyURL := c.baseURL + "api/upload/verify/token?token=" + url.QueryEscape(token) + "&type=image"
+	if err := c.doJSON(ctx, http.MethodGet, verifyURL, nil, &verifyOut); err == nil {
+		if mediaURL := uploadVerifyURL(verifyOut); mediaURL != "" {
+			return mediaURL, nil
+		}
+	}
+	browserOut, err := c.requestWithBrowser(ctx, "/api/upload/verify/token", "get", nil, map[string]interface{}{"token": token, "type": "image"}, "api/upload/verify/token")
+	if err != nil {
 		return "", err
 	}
-	mediaURL := nestedString(verifyOut, "data", "url")
-	if mediaURL == "" {
-		return "", errors.New("upload verify did not return media url")
+	if mediaURL := uploadVerifyURL(browserOut); mediaURL != "" {
+		return mediaURL, nil
 	}
-	return mediaURL, nil
+	return "", fmt.Errorf("upload verify did not return media url: %s", mustJSON(browserOut))
 }
 
 func (c *klingClient) doJSON(ctx context.Context, method, endpoint string, payload interface{}, out interface{}) error {
@@ -1677,6 +1756,86 @@ func nestedString(root map[string]interface{}, path ...string) string {
 		current = m[key]
 	}
 	return stringFromAny(current)
+}
+
+func uploadIssueToken(root map[string]interface{}) (string, []string) {
+	if root == nil {
+		return "", nil
+	}
+	candidates := []map[string]interface{}{root}
+	if data, ok := root["data"].(map[string]interface{}); ok {
+		candidates = append(candidates, data)
+	}
+	for _, candidate := range candidates {
+		token := firstNonEmpty(
+			stringFromAny(candidate["token"]),
+			stringFromAny(candidate["uploadToken"]),
+			stringFromAny(candidate["upload_token"]),
+		)
+		endpoints := firstStringSlice(
+			candidate["httpEndpoints"],
+			candidate["http_endpoints"],
+			candidate["endpoints"],
+		)
+		if token != "" {
+			return token, endpoints
+		}
+	}
+	return "", nil
+}
+
+func uploadVerifyURL(root map[string]interface{}) string {
+	if root == nil {
+		return ""
+	}
+	candidates := []map[string]interface{}{root}
+	if data, ok := root["data"].(map[string]interface{}); ok {
+		candidates = append(candidates, data)
+	}
+	for _, candidate := range candidates {
+		if value := firstNonEmpty(
+			stringFromAny(candidate["url"]),
+			stringFromAny(candidate["resourceUrl"]),
+			stringFromAny(candidate["resource_url"]),
+			stringFromAny(candidate["cdnUrl"]),
+			stringFromAny(candidate["cdn_url"]),
+		); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func firstStringSlice(values ...interface{}) []string {
+	for _, value := range values {
+		switch v := value.(type) {
+		case []string:
+			out := make([]string, 0, len(v))
+			for _, item := range v {
+				if strings.TrimSpace(item) != "" {
+					out = append(out, item)
+				}
+			}
+			if len(out) > 0 {
+				return out
+			}
+		case []interface{}:
+			out := make([]string, 0, len(v))
+			for _, item := range v {
+				if text := strings.TrimSpace(stringFromAny(item)); text != "" {
+					out = append(out, text)
+				}
+			}
+			if len(out) > 0 {
+				return out
+			}
+		case string:
+			if text := strings.TrimSpace(v); text != "" {
+				return []string{text}
+			}
+		}
+	}
+	return nil
 }
 
 func trimBody(body []byte) string {

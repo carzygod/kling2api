@@ -50,6 +50,8 @@ func HandleAdminAPI(w http.ResponseWriter, r *http.Request) {
 	switch parts[0] {
 	case "accounts":
 		handleAccountsAPI(w, r, parts[1:])
+	case "debug":
+		handleDebugAPI(w, r, parts[1:])
 	case "login-sessions":
 		handleLoginSessionsAPI(w, r, parts[1:])
 	case "models":
@@ -121,10 +123,11 @@ func handleAccountsAPI(w http.ResponseWriter, r *http.Request, parts []string) {
 				writeJSON(w, http.StatusOK, map[string]interface{}{"session": view, "data": view})
 				return
 			}
+			req.CookieJSON, req.CookieString = normalizeCookieMaterial(req.CookieJSON, req.CookieString)
 			account, err := AppStore.CreateAccount(AccountRecord{
 				Name:             req.Name,
-				Type:             "cookie",
-				Status:           "imported",
+				Type:             "kling-web-cookie",
+				Status:           "importing",
 				CookieJSON:       req.CookieJSON,
 				CookieString:     req.CookieString,
 				LocalStorageJSON: req.LocalStorageJSON,
@@ -135,8 +138,13 @@ func handleAccountsAPI(w http.ResponseWriter, r *http.Request, parts []string) {
 				writeError(w, http.StatusInternalServerError, "create_account_failed", err.Error())
 				return
 			}
+			ok, message := bootstrapImportedAccountProfile(account)
+			_ = AppStore.SetAccountTestResult(account.ID, ok, message)
+			if refreshed, err := AppStore.GetAccount(account.ID); err == nil {
+				account = refreshed
+			}
 			view := accountView(*account)
-			writeJSON(w, http.StatusOK, map[string]interface{}{"account": view, "data": view})
+			writeJSON(w, http.StatusOK, map[string]interface{}{"account": view, "data": view, "ok": ok, "status": view.Status, "message": message})
 		default:
 			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "unsupported method")
 		}
@@ -171,6 +179,63 @@ func handleAccountsAPI(w http.ResponseWriter, r *http.Request, parts []string) {
 		return
 	}
 	writeError(w, http.StatusNotFound, "not_found", "unknown account api path")
+}
+
+func handleDebugAPI(w http.ResponseWriter, r *http.Request, parts []string) {
+	if len(parts) == 0 || parts[0] != "official" {
+		writeError(w, http.StatusNotFound, "not_found", "unknown debug api path")
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "use GET")
+		return
+	}
+	apiPath := r.URL.Query().Get("path")
+	if apiPath == "" {
+		apiPath = "/api/user/works/personal/feeds"
+	}
+	if !strings.HasPrefix(apiPath, "/api/") {
+		writeError(w, http.StatusBadRequest, "bad_path", "path must start with /api/")
+		return
+	}
+	accountID := r.URL.Query().Get("account_id")
+	account, err := AppStore.SelectRunnableAccount(accountID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "select_account_failed", err.Error())
+		return
+	}
+	client, err := newKlingClient(account)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "client_failed", err.Error())
+		return
+	}
+	params := map[string]interface{}{}
+	for key, values := range r.URL.Query() {
+		switch key {
+		case "key", "path", "account_id":
+			continue
+		}
+		if len(values) == 1 {
+			params[key] = values[0]
+		} else if len(values) > 1 {
+			items := make([]interface{}, 0, len(values))
+			for _, value := range values {
+				items = append(items, value)
+			}
+			params[key] = items
+		}
+	}
+	out, err := client.requestWithBrowser(r.Context(), apiPath, http.MethodGet, nil, params, apiPath)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "official_request_failed", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"account_id": account.ID,
+		"path":       apiPath,
+		"params":     params,
+		"data":       out,
+	})
 }
 
 func handleLoginSessionsAPI(w http.ResponseWriter, r *http.Request, parts []string) {

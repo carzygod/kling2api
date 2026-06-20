@@ -15,8 +15,10 @@ func main() {
 		internal.LogError("sqlite init failed: %v", err)
 		return
 	}
+	internal.CleanupTransientChromeProfiles()
 
 	internal.LoginSessions = internal.NewLoginSessionManager()
+	internal.StartAccountKeepalive()
 
 	http.HandleFunc("/health", internal.HandleHealth)
 	http.HandleFunc("/admin", internal.HandleAdminPage)

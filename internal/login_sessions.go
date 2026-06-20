@@ -263,13 +263,7 @@ func (s *LoginSession) Capture(name string) (*AccountRecord, error) {
 	err := s.runBrowser(25*time.Second,
 		chromedp.ActionFunc(func(ctx context.Context) error {
 			var err error
-			cookies, err = network.GetCookies().WithURLs([]string{
-				"https://klingai.com/",
-				"https://www.klingai.com/",
-				"https://klingai.com/app",
-				"https://app.klingai.com/",
-				"https://id.klingai.com/",
-			}).Do(ctx)
+			cookies, err = network.GetCookies().WithURLs(klingCookieURLs(Cfg.LoginURL)).Do(ctx)
 			return err
 		}),
 		chromedp.Evaluate(`JSON.stringify(Object.fromEntries(Object.entries(localStorage)))`, &localStorageJSON),
@@ -306,6 +300,12 @@ func (s *LoginSession) Capture(name string) (*AccountRecord, error) {
 		s.setError(err)
 		return nil, err
 	}
+	if err := persistAccountChromeProfile(account.ID, s.profile); err != nil {
+		_ = AppStore.DeleteAccount(account.ID)
+		s.setError(err)
+		return nil, fmt.Errorf("persist Kling browser profile failed: %w", err)
+	}
+	_ = AppStore.AddEvent(account.ID, "profile_saved", "persistent chrome profile saved", map[string]interface{}{"path": accountChromeProfilePath(account.ID)})
 	_ = AppStore.SetAccountTestResult(account.ID, true, "klingai.com profile is authenticated")
 	s.mu.Lock()
 	s.Status = "captured"
@@ -361,8 +361,25 @@ func cookiesToString(cookies []*network.Cookie) string {
 }
 
 func testKlingAccount(a *AccountRecord) (bool, string) {
-	if a == nil || a.CookieString == "" {
+	if a == nil {
+		return false, "empty account"
+	}
+	if a.CookieString == "" && !accountChromeProfileExists(a.ID) {
 		return false, "empty cookie string"
+	}
+	if accountChromeProfileExists(a.ID) {
+		client, err := newKlingClient(a)
+		if err != nil {
+			return false, err.Error()
+		}
+		out, err := client.requestWithBrowser(context.Background(), "/api/user/profile_and_features", http.MethodGet, nil, nil, "api/user/profile_and_features")
+		if err != nil {
+			return false, err.Error()
+		}
+		if hasKlingUserProfile(out) {
+			return true, "klingai.com persistent browser profile is authenticated"
+		}
+		return false, fmt.Sprintf("klingai.com persistent browser profile did not include authenticated user: %s", trimBody([]byte(mustJSON(out))))
 	}
 	if ok, message := hasFreshTaskCookies(a.CookieJSON); !ok {
 		return false, message
