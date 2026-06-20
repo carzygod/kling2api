@@ -498,12 +498,44 @@ func (c *klingClient) buildVideoPayload(ctx context.Context, req mediaGeneration
 		if err != nil {
 			return nil, err
 		}
+		if omniVideo {
+			settings := []map[string]interface{}{
+				{"name": "negative_prompt", "value": negativePrompt},
+				{"name": "cfg", "value": cfg},
+				{"name": "duration", "value": strconv.Itoa(duration)},
+				{"name": "aspect_ratio", "value": ratio},
+				{"name": "camera_json", "value": cameraJSON},
+				{"name": "model_mode", "value": videoModelMode(req, model)},
+			}
+			args := []map[string]interface{}{
+				{"name": "skill", "value": ""},
+				{"name": "biz", "value": "klingai"},
+				{"name": "kling_version", "value": version},
+			}
+			args = append(args, settings...)
+			args = append(args,
+				map[string]interface{}{"name": "prompt", "value": req.Prompt},
+				map[string]interface{}{"name": "rich_prompt", "value": req.Prompt},
+				map[string]interface{}{"name": "prefer_multi_shots", "value": "false"},
+				map[string]interface{}{"name": "start_frame_index", "value": 1},
+			)
+			return map[string]interface{}{
+				"type": "m2v_omni_video",
+				"inputs": []map[string]interface{}{
+					{"inputType": "URL", "url": firstURL, "name": "image_1"},
+					{"inputType": "URL", "url": lastURL, "name": "image_2"},
+				},
+				"arguments": args,
+				"callbackPayloads": []map[string]interface{}{
+					{"name": "settingKeys", "value": settingKeys(settings)},
+					{"name": "imageMasks", "value": "", "resources": []map[string]interface{}{}},
+					{"name": "subjects", "value": "[]"},
+				},
+			}, nil
+		}
 		modelType := "m2v_img2video"
 		if highQuality {
 			modelType = "m2v_img2video_hq"
-		}
-		if omniVideo {
-			modelType = "m2v_omni_video"
 		}
 		args := []map[string]interface{}{
 			{"name": "prompt", "value": req.Prompt},
@@ -514,9 +546,6 @@ func (c *klingClient) buildVideoPayload(ctx context.Context, req mediaGeneration
 			{"name": "tail_image_enabled", "value": "true"},
 			{"name": "camera_json", "value": cameraJSON},
 			{"name": "biz", "value": "klingai"},
-		}
-		if omniVideo {
-			args = append(args, map[string]interface{}{"name": "model_mode", "value": videoModelMode(req, model)})
 		}
 		args = appendVideoOptionalArgs(args, req)
 		return map[string]interface{}{
@@ -1621,6 +1650,16 @@ func appendVideoOptionalArgs(args []map[string]interface{}, req mediaGenerationR
 		args = append(args, map[string]interface{}{"name": "generate_audio", "value": value})
 	}
 	return args
+}
+
+func settingKeys(settings []map[string]interface{}) string {
+	keys := make([]string, 0, len(settings))
+	for _, item := range settings {
+		if key := stringFromAny(item["name"]); key != "" {
+			keys = append(keys, key)
+		}
+	}
+	return strings.Join(keys, "|")
 }
 
 func videoModelMode(req mediaGenerationRequest, model string) string {

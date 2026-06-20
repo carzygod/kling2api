@@ -139,7 +139,7 @@ Video models:
 | `kling-video-2.1-hq` | `/v1/videos/generations` | `m2v_txt2video_hq` / `m2v_img2video_hq` | 2.1 | mapped |
 | `kling-v2-5-turbo` / `kling-video-2.5-turbo` | `/v1/videos/generations` | `m2v_txt2video` / `m2v_img2video` | 2.5 | mapped |
 | `kling-v2-6` | `/v1/videos/generations` | `m2v_txt2video` / `m2v_img2video` | 2.6 | mapped |
-| `kling-v3` / `kling-video-3.0` | `/v1/videos/generations` | `m2v_omni_video` | 3.0-omni | verified for text-to-video on SH01 |
+| `kling-v3` / `kling-video-3.0` | `/v1/videos/generations` | `m2v_omni_video` / `m2v_omni_image2video_first_tail_v30_720p` | 3.0-omni | verified for text-to-video and first/last-frame video on SH01 |
 | `kling-video-first-last-frame` | `/v1/videos/generations` | `m2v_img2video` with `tail_image` | 2.1+ | mapped |
 | `kling-action-clone` | `/v1/videos/generations` | `m2v_motion_clone` | 2.1+ | mapped |
 | `kling-video-extend` | `/v1/videos/generations` | `m2v_extend_video` | 1.5+ | mapped |
@@ -147,7 +147,8 @@ Video models:
 Known unsupported / not mapped:
 
 - `kling-image-v3` is intentionally not listed. Testing on SH01 showed that simply sending `kolors_version: 3.0` to the legacy `mmu_txt2img_aiweb` task returns upstream `TASK.InvalidTaskType`, and a guessed `kling_img_web` task returns `BASE.OperationUnsupported`.
-- In the current wrapper, "Kling 3.0" means video generation via `kling-v3` or `kling-video-3.0`. It uses Kling Web's current Omni payload: `type=m2v_omni_video`, `kling_version=3.0-omni`, and `model_mode=720p` by default.
+- In the current wrapper, "Kling 3.0" means video generation via `kling-v3` or `kling-video-3.0`. Text-to-video uses Kling Web's current Omni payload: `type=m2v_omni_video`, `kling_version=3.0-omni`, and `model_mode=720p` by default.
+- Kling 3.0 first/last-frame video must use the Omni material-slot protocol. When `first_frame_image` and `last_frame_image` are both present, this wrapper sends `image_1`, `image_2`, and `start_frame_index=1`, which Kling Web resolves to `m2v_omni_image2video_first_tail_v30_720p`. The old `input` plus `tail_image` shape is only for legacy 2.x models.
 
 ## Image Generation
 
@@ -250,6 +251,20 @@ First/last-frame video:
   "first_frame_image": "https://example.com/first.png",
   "last_frame_image": "https://example.com/last.png",
   "duration": 5
+}
+```
+
+Kling 3.0 first/last-frame video:
+
+```json
+{
+  "model": "kling-v3",
+  "prompt": "smooth transition between the two frames",
+  "first_frame_image": "https://example.com/first.png",
+  "last_frame_image": "https://example.com/last.png",
+  "duration": 5,
+  "aspect_ratio": "1:1",
+  "model_mode": "720p"
 }
 ```
 
