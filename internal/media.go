@@ -88,6 +88,15 @@ func HandleImageGenerations(w http.ResponseWriter, r *http.Request) {
 	if req.Model == "" {
 		req.Model = "kling-image"
 	}
+	if isKlingVideoModelName(req.Model) {
+		writeError(
+			w,
+			http.StatusBadRequest,
+			"video_model_on_image_endpoint",
+			fmt.Sprintf("model %q is a video model; use /v1/video/generations or /v1/videos/generations", req.Model),
+		)
+		return
+	}
 	task, client, payload, err := submitMediaTask(r.Context(), "image", req)
 	if err != nil {
 		writeError(w, httpStatusForMediaErr(err), mediaErrCode(err), err.Error())
@@ -1608,6 +1617,16 @@ func klingVersion(model string) string {
 func isUnsupportedImageModel(model string) bool {
 	model = strings.ToLower(strings.TrimSpace(model))
 	return strings.Contains(model, "image") && (strings.Contains(model, "v3") || strings.Contains(model, "3.0"))
+}
+
+func isKlingVideoModelName(model string) bool {
+	model = strings.ToLower(strings.TrimSpace(model))
+	if model == "" || strings.Contains(model, "image") {
+		return false
+	}
+	return strings.Contains(model, "video") ||
+		strings.Contains(model, "action-clone") ||
+		strings.HasPrefix(model, "kling-v")
 }
 
 func kolorsVersion(model string) string {
