@@ -50,6 +50,11 @@ func (c *klingClient) downloadURLWithBrowser(parent context.Context, workID, tas
 func (c *klingClient) requestWithBrowser(parent context.Context, apiPath, method string, data, params map[string]interface{}, moduleHint string) (map[string]interface{}, error) {
 	unlock := lockAccountChromeProfile(c.account.ID)
 	defer unlock()
+	if active, err := AppStore.IsAccountInMaintenance(c.account.ID); err != nil {
+		return nil, err
+	} else if active {
+		return nil, fmt.Errorf("account %s entered maintenance before browser startup", c.account.ID)
+	}
 
 	profileRoot := filepath.Join(Cfg.DataDir, "chrome-api-profiles")
 	if err := os.MkdirAll(profileRoot, 0o755); err != nil {

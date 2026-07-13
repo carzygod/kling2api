@@ -152,11 +152,16 @@ func handleAccountsAPI(w http.ResponseWriter, r *http.Request, parts []string) {
 	}
 	id := parts[0]
 	if len(parts) == 1 && r.Method == http.MethodDelete {
+		LoginSessions.DeleteByAccountID(id)
 		if err := AppStore.DeleteAccount(id); err != nil {
 			writeError(w, http.StatusInternalServerError, "delete_account_failed", err.Error())
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true})
+		return
+	}
+	if len(parts) >= 2 && parts[1] == "maintenance" {
+		handleAccountMaintenanceAPI(w, r, id, parts[2:])
 		return
 	}
 	if len(parts) == 2 && parts[1] == "test" && r.Method == http.MethodPost {
@@ -179,6 +184,97 @@ func handleAccountsAPI(w http.ResponseWriter, r *http.Request, parts []string) {
 		return
 	}
 	writeError(w, http.StatusNotFound, "not_found", "unknown account api path")
+}
+
+func handleAccountMaintenanceAPI(w http.ResponseWriter, r *http.Request, accountID string, parts []string) {
+	action := "status"
+	if len(parts) > 0 && parts[0] != "" {
+		action = parts[0]
+	}
+	switch action {
+	case "status":
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "use GET")
+			return
+		}
+		record, err := AppStore.GetAccountMaintenance(accountID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "maintenance_status_failed", err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"data": record})
+	case "start":
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "use POST")
+			return
+		}
+		session, err := LoginSessions.CreateMaintenance(accountID)
+		if err != nil {
+			writeError(w, http.StatusConflict, "maintenance_start_failed", err.Error())
+			return
+		}
+		view := sessionView(session.publicCopy())
+		writeJSON(w, http.StatusOK, map[string]interface{}{"session": view, "data": view})
+	case "heartbeat":
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "use POST")
+			return
+		}
+		var req struct{ LeaseOwner string `json:"lease_owner"` }
+		if err := decodeJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, "bad_json", err.Error())
+			return
+		}
+		record, err := AppStore.HeartbeatAccountMaintenance(accountID, req.LeaseOwner, defaultMaintenanceLease)
+		if err != nil {
+			writeError(w, http.StatusConflict, "maintenance_heartbeat_failed", err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"data": record})
+	case "stop":
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "use POST")
+			return
+		}
+		record, err := AppStore.GetAccountMaintenance(accountID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "maintenance_status_failed", err.Error())
+			return
+		}
+		if record.LeaseOwner != "" && LoginSessions.Delete(record.LeaseOwner) {
+			writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "state": "active"})
+			return
+		}
+		if record.LeaseOwner != "" {
+			writeError(w, http.StatusConflict, "maintenance_owned_elsewhere", "active maintenance lease is owned by another process")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "state": "active"})
+	case "validate":
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "use POST")
+			return
+		}
+		active, err := AppStore.IsAccountInMaintenance(accountID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "maintenance_status_failed", err.Error())
+			return
+		}
+		if active {
+			writeError(w, http.StatusConflict, "maintenance_active", "stop maintenance before validation")
+			return
+		}
+		account, err := AppStore.GetAccount(accountID)
+		if err != nil {
+			writeError(w, http.StatusNotFound, "account_not_found", err.Error())
+			return
+		}
+		ok, message := testKlingAccount(account)
+		_ = AppStore.SetAccountTestResult(accountID, ok, message)
+		writeJSON(w, http.StatusOK, map[string]interface{}{"ok": ok, "status": map[bool]string{true: "valid", false: "invalid"}[ok], "message": message})
+	default:
+		writeError(w, http.StatusNotFound, "maintenance_action_not_found", "unknown maintenance action")
+	}
 }
 
 func handleDebugAPI(w http.ResponseWriter, r *http.Request, parts []string) {
@@ -437,6 +533,9 @@ func sessionView(session *LoginSession) map[string]interface{} {
 		"created_at":     session.CreatedAt,
 		"updated_at":     session.UpdatedAt,
 		"login_url":      session.LoginURL,
+		"account_id":     session.AccountID,
+		"mode":           session.Mode,
+		"novnc_url":      session.NoVNCURL,
 		"cookie_count":   0,
 		"screenshot_url": "/api/login-sessions/" + session.ID + "/screenshot",
 	}

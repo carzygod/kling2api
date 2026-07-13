@@ -38,6 +38,9 @@ KLING_CREATOR_ADMIN_KEY=replace-with-admin-key
 KLING_CREATOR_AUTH_KEY=replace-with-api-key
 KLING_LOGIN_URL=https://klingai.com/app
 CHROME_EXECUTABLE=/usr/bin/chromium
+BROWSER_HEADLESS=true
+NOVNC_URL=
+VNC_PASSWORD=
 ```
 
 ## Docker
@@ -337,3 +340,15 @@ kling_tasks
 ```
 
 The account pool stores only upstream Kling Web login material. It does not store NewAPI channel keys or official API keys.
+
+## Private noVNC account maintenance
+
+Build with `Dockerfile.novnc`, set `VNC_PASSWORD` and `NOVNC_URL`, and publish container
+port `6080` on host `127.0.0.1` only. Maintenance reopens the existing per-account
+profile under `DATA_DIR/account-chrome-profiles/<account-id>` while holding both the
+SQLite lease and the in-process profile lock. Normal browser submissions recheck the
+lease after acquiring that lock.
+
+The admin contract is `/api/accounts/{id}/maintenance/{start|heartbeat|stop|validate}`.
+Cookie capture continues through `/api/login-sessions/{lease-owner}/capture`; capture
+closes the browser and releases the profile lock before the response returns.

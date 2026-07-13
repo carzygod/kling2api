@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -27,13 +26,22 @@ type LoginSession struct {
 	CreatedAt string `json:"created_at"`
 	UpdatedAt string `json:"updated_at"`
 	LoginURL  string `json:"login_url"`
+	AccountID string `json:"account_id,omitempty"`
+	Mode      string `json:"mode"`
+	NoVNCURL  string `json:"novnc_url,omitempty"`
 
-	ctx        context.Context
-	cancel     context.CancelFunc
-	profile    string
-	screenshot []byte
-	mu         sync.Mutex
-	runMu      sync.Mutex
+	ctx               context.Context
+	cancel            context.CancelFunc
+	profile           string
+	targetAccountID   string
+	existingAccountID string
+	profilePersistent bool
+	leaseOwner        string
+	profileUnlock     func()
+	screenshot        []byte
+	captureMu         sync.Mutex
+	mu                sync.Mutex
+	runMu             sync.Mutex
 }
 
 type LoginSessionManager struct {
@@ -48,18 +56,40 @@ func NewLoginSessionManager() *LoginSessionManager {
 }
 
 func (m *LoginSessionManager) Create(name string) (*LoginSession, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	id := uuid.NewString()
+	return m.createSession(id, name, uuid.NewString(), "new_account", "", nil)
+}
+
+func (m *LoginSessionManager) CreateMaintenance(accountID string) (*LoginSession, error) {
+	account, err := AppStore.GetAccount(strings.TrimSpace(accountID))
+	if err != nil {
+		return nil, err
+	}
+	id := uuid.NewString()
+	if _, err := AppStore.BeginAccountMaintenance(account.ID, id, defaultMaintenanceLease); err != nil {
+		return nil, err
+	}
+	unlock := lockAccountChromeProfile(account.ID)
+	session, err := m.createSession(id, account.Name, account.ID, "maintenance", id, unlock)
+	if err != nil {
+		unlock()
+		_ = AppStore.EndAccountMaintenance(account.ID, id, err.Error())
+		return nil, err
+	}
+	go session.heartbeatMaintenance()
+	return session, nil
+}
+
+func (m *LoginSessionManager) createSession(id, name, accountID, mode, leaseOwner string, profileUnlock func()) (*LoginSession, error) {
 	if name == "" {
 		name = "kling-login-" + id[:8]
 	}
-	profile := filepath.Join(Cfg.DataDir, "chrome-profiles", id)
+	profile := accountChromeProfilePath(accountID)
 	if err := os.MkdirAll(profile, 0o755); err != nil {
 		return nil, err
 	}
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.Flag("headless", true),
+		chromedp.Flag("headless", Cfg.BrowserHeadless),
 		chromedp.Flag("disable-gpu", true),
 		chromedp.Flag("no-sandbox", true),
 		chromedp.Flag("disable-dev-shm-usage", true),
@@ -73,6 +103,10 @@ func (m *LoginSessionManager) Create(name string) (*LoginSession, error) {
 	}
 	allocCtx, allocCancel := chromedp.NewExecAllocator(context.Background(), opts...)
 	ctx, cancel := chromedp.NewContext(allocCtx)
+	existingAccountID := ""
+	if mode == "maintenance" {
+		existingAccountID = accountID
+	}
 	session := &LoginSession{
 		ID:        id,
 		Name:      name,
@@ -80,16 +114,61 @@ func (m *LoginSessionManager) Create(name string) (*LoginSession, error) {
 		CreatedAt: nowISO(),
 		UpdatedAt: nowISO(),
 		LoginURL:  Cfg.LoginURL,
+		Mode:      mode,
+		NoVNCURL:  Cfg.NoVNCURL,
 		ctx:       ctx,
 		cancel: func() {
 			cancel()
 			allocCancel()
 		},
-		profile: profile,
+		profile:           profile,
+		targetAccountID:   accountID,
+		existingAccountID: existingAccountID,
+		profilePersistent: mode == "maintenance",
+		leaseOwner:        leaseOwner,
+		profileUnlock:     profileUnlock,
+	}
+	m.mu.Lock()
+	if Cfg.NoVNCURL != "" {
+		for _, existing := range m.sessions {
+			existing.mu.Lock()
+			status := existing.Status
+			existing.mu.Unlock()
+			if status != "captured" && status != "error" && status != "closed" {
+				m.mu.Unlock()
+				session.cancel()
+				return nil, errors.New("another interactive login session is already active")
+			}
+		}
 	}
 	m.sessions[id] = session
+	m.mu.Unlock()
 	go session.start()
 	return session, nil
+}
+
+func (s *LoginSession) heartbeatMaintenance() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			s.mu.Lock()
+			accountID, owner := s.existingAccountID, s.leaseOwner
+			s.mu.Unlock()
+			if accountID == "" || owner == "" {
+				return
+			}
+			if _, err := AppStore.HeartbeatAccountMaintenance(accountID, owner, defaultMaintenanceLease); err != nil {
+				s.setError(err)
+				s.Close()
+				return
+			}
+		case <-s.ctx.Done():
+			s.Close()
+			return
+		}
+	}
 }
 
 func (m *LoginSessionManager) List() []*LoginSession {
@@ -134,10 +213,10 @@ func (s *LoginSession) start() {
 	)
 	if err != nil {
 		s.setError(err)
+		s.Close()
 		return
 	}
-	s.Status = "waiting_scan"
-	s.UpdatedAt = nowISO()
+	s.setStatus("waiting_scan")
 	_ = s.RefreshScreenshot()
 }
 
@@ -254,6 +333,16 @@ func (s *LoginSession) Reload() error {
 }
 
 func (s *LoginSession) Capture(name string) (*AccountRecord, error) {
+	s.captureMu.Lock()
+	defer s.captureMu.Unlock()
+	s.mu.Lock()
+	existingAccountID, targetAccountID, leaseOwner := s.existingAccountID, s.targetAccountID, s.leaseOwner
+	s.mu.Unlock()
+	if existingAccountID != "" && leaseOwner != "" {
+		if _, err := AppStore.HeartbeatAccountMaintenance(existingAccountID, leaseOwner, defaultMaintenanceLease); err != nil {
+			return nil, err
+		}
+	}
 	if name == "" {
 		name = s.Name
 	}
@@ -288,38 +377,92 @@ func (s *LoginSession) Capture(name string) (*AccountRecord, error) {
 	if ok, message := testKlingAccount(probe); !ok {
 		return nil, errors.New("captured Kling session is not authenticated: " + message)
 	}
-	account, err := AppStore.CreateAccount(AccountRecord{
+	accountInput := AccountRecord{
+		ID:               targetAccountID,
 		Name:             name,
 		Status:           "valid",
 		CookieJSON:       string(cookieJSON),
 		CookieString:     cookieString,
 		LocalStorageJSON: localStorageJSON,
 		UserAgent:        userAgent,
-	})
+	}
+	var account *AccountRecord
+	if existingAccountID != "" {
+		if _, err := AppStore.HeartbeatAccountMaintenance(existingAccountID, leaseOwner, defaultMaintenanceLease); err != nil {
+			return nil, err
+		}
+		if err := AppStore.UpdateAccountSessionSnapshot(existingAccountID, accountInput.CookieJSON, accountInput.CookieString, accountInput.LocalStorageJSON, accountInput.UserAgent); err != nil {
+			s.setError(err)
+			return nil, err
+		}
+		account, err = AppStore.GetAccount(existingAccountID)
+	} else {
+		account, err = AppStore.CreateAccount(accountInput)
+	}
 	if err != nil {
 		s.setError(err)
 		return nil, err
 	}
-	if err := persistAccountChromeProfile(account.ID, s.profile); err != nil {
-		_ = AppStore.DeleteAccount(account.ID)
-		s.setError(err)
-		return nil, fmt.Errorf("persist Kling browser profile failed: %w", err)
-	}
-	_ = AppStore.AddEvent(account.ID, "profile_saved", "persistent chrome profile saved", map[string]interface{}{"path": accountChromeProfilePath(account.ID)})
+	_ = AppStore.AddEvent(account.ID, "profile_saved", "persistent chrome profile saved", map[string]interface{}{"path": s.profile})
 	_ = AppStore.SetAccountTestResult(account.ID, true, "klingai.com profile is authenticated")
 	s.mu.Lock()
 	s.Status = "captured"
+	s.AccountID = account.ID
+	s.profilePersistent = true
 	s.UpdatedAt = nowISO()
 	s.mu.Unlock()
+	s.Close()
 	return account, nil
 }
 
-func (s *LoginSession) Close() {
-	if s.cancel != nil {
-		s.cancel()
+func (m *LoginSessionManager) DeleteByAccountID(accountID string) []string {
+	accountID = strings.TrimSpace(accountID)
+	ids := []string{}
+	m.mu.Lock()
+	targets := []*LoginSession{}
+	for id, session := range m.sessions {
+		session.mu.Lock()
+		matches := session.AccountID == accountID || session.targetAccountID == accountID
+		session.mu.Unlock()
+		if matches {
+			delete(m.sessions, id)
+			ids = append(ids, id)
+			targets = append(targets, session)
+		}
 	}
-	if s.profile != "" {
-		_ = os.RemoveAll(s.profile)
+	m.mu.Unlock()
+	for _, session := range targets {
+		session.Close()
+	}
+	return ids
+}
+
+func (s *LoginSession) Close() {
+	s.mu.Lock()
+	cancel := s.cancel
+	s.cancel = nil
+	profile := s.profile
+	persistent := s.profilePersistent
+	accountID, owner := s.existingAccountID, s.leaseOwner
+	s.leaseOwner = ""
+	unlock := s.profileUnlock
+	s.profileUnlock = nil
+	if s.Status != "captured" && s.Status != "error" {
+		s.Status = "closed"
+	}
+	s.UpdatedAt = nowISO()
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if !persistent && profile != "" {
+		_ = os.RemoveAll(profile)
+	}
+	if unlock != nil {
+		unlock()
+	}
+	if accountID != "" && owner != "" {
+		_ = AppStore.EndAccountMaintenance(accountID, owner, "")
 	}
 }
 

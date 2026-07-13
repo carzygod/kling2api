@@ -3,6 +3,7 @@ package internal
 import (
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/joho/godotenv"
 )
@@ -17,6 +18,8 @@ type Config struct {
 	LoginURL     string
 	ChromeExec   string
 	LogLevel     string
+	BrowserHeadless bool
+	NoVNCURL       string
 }
 
 var Cfg Config
@@ -34,6 +37,8 @@ func LoadConfig() {
 		LoginURL:     env("KLING_LOGIN_URL", "https://klingai.com/app"),
 		ChromeExec:   env("CHROME_EXECUTABLE", ""),
 		LogLevel:     env("LOG_LEVEL", "info"),
+		BrowserHeadless: strings.ToLower(strings.TrimSpace(env("BROWSER_HEADLESS", "true"))) != "false",
+		NoVNCURL:       strings.TrimSpace(env("NOVNC_URL", "")),
 	}
 	_ = os.MkdirAll(Cfg.DataDir, 0o755)
 }

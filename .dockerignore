@@ -1,0 +1,16 @@
+.git
+.gitignore
+.env
+.env.*
+data/
+account-chrome-profiles/
+chrome-api-profiles/
+chrome-profiles/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+*.log
+*.test

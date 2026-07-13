@@ -93,6 +93,16 @@ CREATE TABLE IF NOT EXISTS kling_account_events (
   metadata_json TEXT,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS kling_account_maintenance (
+  account_id TEXT PRIMARY KEY,
+  state TEXT NOT NULL DEFAULT 'active',
+  lease_owner TEXT,
+  lease_expires_at TEXT,
+  profile_path TEXT,
+  last_error TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS kling_tasks (
   id TEXT PRIMARY KEY,
   type TEXT NOT NULL,
@@ -171,15 +181,32 @@ func (s *Store) GetAccount(id string) (*AccountRecord, error) {
 
 func (s *Store) SelectRunnableAccount(accountID string) (*AccountRecord, error) {
 	if accountID != "" {
-		return s.GetAccount(accountID)
+		account, err := s.GetAccount(accountID)
+		if err != nil {
+			return nil, err
+		}
+		if active, err := s.IsAccountInMaintenance(accountID); err != nil || active {
+			if err != nil {
+				return nil, err
+			}
+			return nil, fmt.Errorf("account %s is in maintenance", accountID)
+		}
+		if !account.Enabled || (account.Status != "valid" && account.Status != "captured") {
+			return nil, fmt.Errorf("account %s is not runnable", accountID)
+		}
+		return account, nil
 	}
 	var a AccountRecord
 	var enabled int
 	err := s.db.QueryRow(`SELECT id, name, status, enabled, cookie_json, cookie_string, local_storage_json, user_agent, proxy_url, last_error, last_test_at, last_success_at, created_at, updated_at
 		FROM kling_accounts
 		WHERE enabled=1 AND COALESCE(cookie_string, '') <> '' AND status IN ('valid', 'captured')
+		  AND id NOT IN (
+		    SELECT account_id FROM kling_account_maintenance
+		    WHERE state IN ('maintenance', 'validating') AND lease_expires_at > ?
+		  )
 		ORDER BY CASE status WHEN 'valid' THEN 0 WHEN 'captured' THEN 1 ELSE 2 END, updated_at DESC
-		LIMIT 1`).
+		LIMIT 1`, nowISO()).
 		Scan(&a.ID, &a.Name, &a.Status, &enabled, &a.CookieJSON, &a.CookieString, &a.LocalStorageJSON, &a.UserAgent, &a.ProxyURL, &a.LastError, &a.LastTestAt, &a.LastSuccessAt, &a.CreatedAt, &a.UpdatedAt)
 	if err != nil {
 		return nil, err
@@ -189,12 +216,28 @@ func (s *Store) SelectRunnableAccount(accountID string) (*AccountRecord, error) 
 }
 
 func (s *Store) DeleteAccount(id string) error {
-	_, err := s.db.Exec(`DELETE FROM kling_accounts WHERE id=?`, id)
-	if err == nil {
-		_ = s.AddEvent(id, "deleted", "account deleted", nil)
-		_ = removeAccountChromeProfile(id)
+	if active, err := s.IsAccountInMaintenance(id); err != nil {
+		return err
+	} else if active {
+		return fmt.Errorf("account %s has an active maintenance lease", id)
 	}
-	return err
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM kling_account_maintenance WHERE account_id=?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM kling_accounts WHERE id=?`, id); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	_ = s.AddEvent(id, "deleted", "account deleted", nil)
+	_ = removeAccountChromeProfile(id)
+	return nil
 }
 
 func (s *Store) CreateTask(input TaskRecord) (*TaskRecord, error) {
