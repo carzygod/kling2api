@@ -8,10 +8,13 @@ COPY . .
 RUN CGO_ENABLED=0 go build -o /out/kling-creator-01 .
 
 FROM debian:bookworm-slim
+ARG APP_UID=10001
+ARG APP_GID=10001
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates chromium dumb-init fluxbox fonts-noto-cjk novnc websockify x11vnc xvfb \
     && rm -rf /var/lib/apt/lists/*
-RUN groupadd -r appuser && useradd -r -g appuser appuser
+RUN groupadd --gid "$APP_GID" appuser \
+    && useradd --uid "$APP_UID" --gid "$APP_GID" --create-home --shell /usr/sbin/nologin appuser
 WORKDIR /app
 COPY --from=builder /out/kling-creator-01 /app/kling-creator-01
 COPY scripts/novnc-entrypoint.sh /usr/local/bin/novnc-entrypoint.sh

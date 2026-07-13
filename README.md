@@ -352,3 +352,7 @@ lease after acquiring that lock.
 The admin contract is `/api/accounts/{id}/maintenance/{start|heartbeat|stop|validate}`.
 Cookie capture continues through `/api/login-sessions/{lease-owner}/capture`; capture
 closes the browser and releases the profile lock before the response returns.
+
+The noVNC image runs as UID/GID `10001` by default (`APP_UID`/`APP_GID` build args).
+Named volumes are initialized by the image; a host bind mount for `/data` must be
+owned by that UID/GID before the container starts.
