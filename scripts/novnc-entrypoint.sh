@@ -21,7 +21,7 @@ sleep 1
 fluxbox >/tmp/kling-novnc/fluxbox.log 2>&1 &
 FLUXBOX_PID=$!
 x11vnc -storepasswd "$VNC_PASSWORD" /tmp/kling-novnc/vnc.pass >/dev/null
-x11vnc -display "$DISPLAY" -forever -nevershared -localhost -nofilexfer -norepeat \
+x11vnc -display "$DISPLAY" -forever -nevershared -localhost -norepeat \
   -rfbport "$VNC_PORT" -rfbauth /tmp/kling-novnc/vnc.pass >/tmp/kling-novnc/x11vnc.log 2>&1 &
 VNC_PID=$!
 websockify --web=/usr/share/novnc "${NOVNC_LISTEN}:${NOVNC_PORT}" "localhost:$VNC_PORT" >/tmp/kling-novnc/websockify.log 2>&1 &
